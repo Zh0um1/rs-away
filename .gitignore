@@ -7,3 +7,7 @@
 *.key
 /fuzz/artifacts
 /docs/private
+
+# 本机 `/` 为只读挂载（见 docs/plan.md §1.3），cargo 需要一个可写 CARGO_HOME；
+# 该目录由 `scripts/dev-env.sh` 生成，不入库。
+/.cargo-home

@@ -68,6 +68,11 @@
 | 目标平台 | 见 §4.13（11 个 blocking 组合 + best-effort 档） |
 | 源码规模预期 | 协议 + 加密 + 传输 ≈ 4.5k 行；core ≈ 8k 行；admin（含 TUI）≈ 5k 行；agent ≈ 5k 行；合计约 22k 行（Go 版约 12k 行，增量主要在类型化消息、传输抽象与测试） |
 
+**本机开发环境的两个只读约束**（只影响当前这台开发机，不影响 CI 与普通开发机）：
+
+1. `/` 是只读挂载（`/dev/vda1 on / type ext4 (ro,...)`），只有本工作区与 `/tmp` 可写。`rustup` 拉新 toolchain 需要写 `/root/.rustup/tmp` → 失败（`Read-only file system (os error 30)`）。因此 `rust-toolchain.toml` 固定 `stable`，MSRV 只由 `rust-version` 字段表达（§4.2）。
+2. `CARGO_HOME` 默认在 `/root/.cargo`（只读），cargo 解包 crate 时会写 registry cache → 同样报 os error 30。解决：`scripts/dev-env.sh` 把 registry 复制到工作区内的 `.cargo-home/`（已 gitignore），构建前 `export CARGO_HOME=$PWD/.cargo-home`。
+
 ---
 
 ## 2. Go 现状基线
@@ -251,7 +256,7 @@ Data        [DataLen bytes]   ← 长度是密文长度
 ```
 rs-away/
 ├── Cargo.toml                        # workspace（resolver = "3"）
-├── rust-toolchain.toml               # channel = 1.89（+ rustfmt/clippy）
+├── rust-toolchain.toml               # channel = stable（组件 rustfmt/clippy；MSRV 见 §4.2）
 ├── crates/
 │   ├── stowaway-protocol/            # 帧编解码、消息枚举、SessionKey（无 IO）
 │   ├── stowaway-crypto/              # HKDF/HMAC/X25519/AES-GCM/证书指纹/密封
@@ -273,7 +278,9 @@ rs-away/
 
 ### 4.2 依赖与 MSRV
 
-**MSRV = 1.89**，写进每个 `Cargo.toml` 的 `rust-version` 与 `rust-toolchain.toml`。上限来自 `russh 0.65.2`；`sha2 0.11.1` 与 `ratatui 0.30.2` 需 1.88。
+**MSRV = 1.89**，写进每个 `Cargo.toml` 的 `rust-version`。上限来自 `russh 0.65.2`；`sha2 0.11.1` 与 `ratatui 0.30.2` 需 1.88。
+
+`rust-toolchain.toml` 固定 `channel = "stable"` 而非 `1.89.0`：`rustup` 需要写 `/root/.rustup/tmp` 才能拉取新 toolchain，而本机 `/` 是只读挂载（§1.3），只有工作区与 `/tmp` 可写 → 指定 `1.89.0` 会直接导致 `cargo` 不可用。MSRV 约束因此**只由 `rust-version` 字段表达**，CI（普通开发机）用 `1.89.0` 严格校验。
 
 | 用途 | crate（版本为 2026-11 实测） | 备注 |
 |---|---|---|

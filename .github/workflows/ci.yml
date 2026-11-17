@@ -1,0 +1,68 @@
+name: CI
+
+# 门禁内容对应 docs/plan.md §8.6 DoD 与 §10 G10。
+# 注意：本仓库当前无远端；该文件是 P0 交付物的一部分，供接入 GitHub 后直接生效。
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # 与 Cargo.toml 的 rust-version 对齐；本机 dev 环境因 / 只读只能用 stable（见 plan §4.2）。
+  MSRV: "1.89.0"
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (MSRV)
+        run: |
+          rustup toolchain install "$MSRV" --profile minimal --component rustfmt,clippy
+          rustup default "$MSRV"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: test
+        run: cargo test --workspace --all-features
+
+      # 传输层必须能在最小 feature 集下编译（plan.md §7 P2 出口判据）。
+      - name: build (raw only)
+        run: cargo build -p stowaway-transport --no-default-features --features transport-raw
+
+  doccheck:
+    name: docs 源码引用校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout Go baseline
+        uses: actions/checkout@v4
+        with:
+          repository: ph4ntom11235/Stowaway
+          path: baseline/stowaway
+          # 基线 HEAD 见 docs/plan.md 首页；升级基线必须同步改文档后再改这里。
+          ref: 7f715be
+      - uses: Swatinem/rust-cache@v2
+      - name: doccheck
+        env:
+          STOWAWAY_GO_BASELINE: ${{ github.workspace }}/baseline/stowaway
+        run: cargo run -p xtask -- doccheck
+
+  audit:
+    name: cargo deny (license + advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        continue-on-error: true # P0 阶段仅告警；P7 转为硬门禁（plan.md §10 G10）

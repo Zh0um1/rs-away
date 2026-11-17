@@ -1,0 +1,40 @@
+[package]
+name = "stowaway-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["transport-raw", "transport-ws", "tls"]
+transport-raw = []
+transport-ws = ["dep:tokio-tungstenite"]
+transport-kcp = ["dep:tokio_kcp"]
+transport-quic = []
+tls = [
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:rustls-pki-types",
+    "dep:rcgen",
+    "dep:p256",
+]
+
+[dependencies]
+stowaway-protocol = { workspace = true }
+stowaway-crypto = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+socket2 = { workspace = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+p256 = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+tokio_kcp = { version = "0.9.8", optional = true }
+
+[lints]
+workspace = true

@@ -1,6 +1,124 @@
-[package]
-name = "rs-away"
+[workspace]
+resolver = "3"
+members = [
+    "crates/stowaway-protocol",
+    "crates/stowaway-crypto",
+    "crates/stowaway-transport",
+    "crates/stowaway-core",
+    "crates/stowaway-admin",
+    "crates/stowaway-agent",
+    "xtask",
+]
+default-members = [
+    "crates/stowaway-protocol",
+    "crates/stowaway-crypto",
+    "crates/stowaway-transport",
+    "crates/stowaway-core",
+    "crates/stowaway-admin",
+    "crates/stowaway-agent",
+    "xtask",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
+license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
+# 依赖方向的唯一事实源见 docs/plan.md §4.1 / §4.2。
+stowaway-protocol = { path = "crates/stowaway-protocol" }
+stowaway-crypto = { path = "crates/stowaway-crypto" }
+stowaway-transport = { path = "crates/stowaway-transport" }
+stowaway-core = { path = "crates/stowaway-core" }
+
+# 运行时与 IO
+tokio = { version = "1.54", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "process",
+    "signal",
+    "fs",
+    "macros",
+] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.12"
+futures-util = "0.3"
+
+# 序列化（postcard 是非自描述紧凑编码，schema 演进规则见 plan.md §4.2）
+serde = { version = "1.0.229", features = ["derive"] }
+postcard = { version = "1.1.3", features = ["use-std"] }
+serde_bytes = "0.11"
+
+# 密码学
+aes-gcm = "0.11.1"
+hkdf = "0.13.0"
+hmac = "0.13.0"
+sha2 = "0.11.1"
+subtle = "2.6.1"
+zeroize = { version = "1.9.2", features = ["zeroize_derive"] }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+rand = "0.10.4"
+
+# TLS / WS
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+rustls-pki-types = "1.16"
+rcgen = "0.14.10"
+p256 = "0.14.0"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+
+# 平台
+socket2 = "0.6.5"
+nix = { version = "0.30", features = ["signal", "process"] }
+
+# 应用层
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+encoding_rs = "0.8.44"
+portable-pty = "0.9.0"
+russh = "0.65.2"
+indicatif = "0.18.6"
+
+# TUI（admin 专用）
+ratatui = { version = "0.30.2", default-features = false }
+crossterm = "0.29.0"
+
+# 错误
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+
+# dev
+proptest = "1.12.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+
+[profile.dev]
+debug = 1
+# workspace.dependencies 是「依赖清单」，不要求每条在 P0 就被某个 crate 消费
+# （例如 `nix`/`indicatif` 分别在 P2/P4 才用）。关闭这条 cargo lint 以避免噪声，
+# 真正的不必要依赖仍由 `cargo machete`（后续接入 CI）检查。
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "warn"
+
+[workspace.lints.cargo]
+unused_workspace_dependencies = "allow"
+# P0 阶段各 crate 已声明后续阶段才用到的依赖（如 transport 的 rustls/tungstenite），
+# 关闭该 lint 避免噪声；真正的多余依赖由 `cargo machete` 在 P7 清理。
+unused_dependencies = "allow"
