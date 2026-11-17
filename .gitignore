@@ -1,1 +1,9 @@
 /target
+/release
+*.profraw
+*.log
+.env*
+*.pem
+*.key
+/fuzz/artifacts
+/docs/private
