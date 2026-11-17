@@ -1,0 +1,40 @@
+# 独立的 fuzz workspace（不属于主 workspace：`cargo-fuzz` 需要 nightly +
+# `-Z sanitizer-coverage`，而本机 `/` 只读、rustup 装不了 nightly）。
+#
+# 用法（有 nightly 的机器）：
+#   cargo +nightly fuzz run decode_frame -- -max_total_time=60
+# CI/本机无 nightly 时的等价兜底见
+# `crates/stowaway-protocol/tests/fuzz_smoke.rs`（同语料、同变异策略）。
+[package]
+name = "stowaway-fuzz"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+stowaway-protocol = { path = "../crates/stowaway-protocol" }
+stowaway-crypto = { path = "../crates/stowaway-crypto" }
+
+[[bin]]
+name = "decode_frame"
+path = "fuzz_targets/decode_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_payload"
+path = "fuzz_targets/decode_payload.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "handshake_transcript"
+path = "fuzz_targets/handshake_transcript.rs"
+test = false
+doc = false
+
+[workspace]
