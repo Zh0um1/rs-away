@@ -643,6 +643,14 @@ v2 **不读** v1 配置与持久化格式。迁移动作：重新生成 `--reuse
 
 目标：`FrameCodec::decode`、握手状态机、ws 升级解析（`Sec-WebSocket-Key`/路径）。**CI 策略**：PR 跑 **60 s smoke**、夜间 **1 h**、发版前 **24 h soak**（替换不可执行的「fuzz 24h 一律」）。
 
+`fuzz/` 是独立的 fuzz workspace（不在主 workspace 内），三个 target：`decode_frame`、`decode_payload`、`handshake_transcript`。
+
+**无 nightly 时的等价兜底**：`cargo-fuzz` 需要 nightly + `-Z sanitizer-coverage`，而本机 `/` 为只读挂载、`rustup` 装不了第二个 toolchain（§1.3）。因此 `crates/stowaway-protocol/tests/fuzz_smoke.rs` 提供**同一套语料与变异策略**的确定性版本：
+- `fuzz_smoke_quick`（普通 `cargo test` 内跑，2 万次迭代，约 0.7 s）；
+- `fuzz_smoke_soak`（`#[ignore]`，时长由 `STOWAWAY_FUZZ_SECONDS` 控制，默认 60 s）——这就是 PR/夜间档在本机的执行方式，已实测 60 s 内 19,819,776 次迭代无 panic。
+
+两者的不变量一致：解码器对**任意字节**返回 `Result`，不 panic、不越界、不为长度字段做超量分配。
+
 ### 8.3 传输一致性套件
 
 `tests/transport_conformance`，对每个启用的 `TransportKind` 跑 transport.md §7 的 T1–T9（小包/大流量/背压/双向并发/半关闭/对端 RST/1000 次建连断开/32 并发/`max_frame` 分片）。
@@ -673,10 +681,13 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo xtask doccheck                      # docs/**/*.md 的 `path:LINE` 引用全部有效（P0 前用 scripts/doccheck.sh）
-grep -rn "unwrap()\|expect(" crates/stowaway-protocol/src | grep -v "// assert-ok"   # 必须为空
+cargo xtask no-panic                     # crates/*/src 非测试代码不得有 unwrap/expect/panic/todo/unreachable，
+                                         # 除非该行带 `// assert-ok` 注释说明为何恒不成立；必须 0 命中
 cargo geiger --workspace                  # 协议/加密/传输三 crate 的 unsafe 计数为 0
 ```
 `stowaway-protocol`、`stowaway-crypto`、`stowaway-transport` 顶部 `#![forbid(unsafe_code)]`。
+`crates/*/src` 内的 `#[cfg(test)] mod tests` 与 `crates/*/tests/*.rs` 不受 `no-panic` 约束
+（测试里断言失败本就该 panic）；`no-panic` 只扫每个源文件 `#[cfg(test)]` 之前的部分。
 
 **§3 的 13 项缺陷各有一条回归测试**（测试名以 `defect_<n>_` 开头，`cargo test defect_` 可一次跑全）。
 

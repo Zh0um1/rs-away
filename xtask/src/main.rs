@@ -24,6 +24,7 @@ fn main() -> ExitCode {
         ),
         "test" => test(),
         "doccheck" => run_doccheck(),
+        "no-panic" => run_no_panic(),
         "help" | "-h" | "--help" => {
             print_help();
             ExitCode::SUCCESS
@@ -38,11 +39,12 @@ fn main() -> ExitCode {
 fn print_help() {
     println!(
         r#"xtask 任务：
-  check       fmt --check + clippy + test（提交前必跑，plan.md §10 G5.4）
+  check       fmt --check + clippy + test + no-panic（提交前必跑，plan.md §10 G5.4）
   fmt         cargo fmt --all --check
   clippy      cargo clippy --workspace --all-targets --all-features -- -D warnings
   test        cargo test --workspace --all-features
   doccheck    校验 docs/**.md 内所有 `path/to/file.go:LINE` 引用有效
+  no-panic    校验 crates/*/src 的非测试代码里没有 panic 类构造
   help        显示本帮助"#
     );
 }
@@ -69,6 +71,11 @@ fn run_check() -> ExitCode {
             eprintln!("xtask check: {label} 失败");
             return ExitCode::FAILURE;
         }
+    }
+    eprintln!("==> no-panic");
+    if run_no_panic() != ExitCode::SUCCESS {
+        eprintln!("xtask check: no-panic 失败");
+        return ExitCode::FAILURE;
     }
     eprintln!("xtask check: 全部通过");
     ExitCode::SUCCESS
@@ -111,6 +118,84 @@ fn run_doccheck() -> ExitCode {
         Err(e) => {
             eprintln!("doccheck: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// `no-panic`：plan.md §8.6 的 DoD 条款。生产代码（`crates/*/src` 中
+/// `#[cfg(test)]` 之前的部分）不得出现 `unwrap()` / `expect(` / `panic!` /
+/// `todo!` / `unimplemented!` / `unreachable!`，除非该行带 `// assert-ok` 注释
+/// 说明「恒不成立」。集成测试（`tests/`）不受此限。
+fn run_no_panic() -> ExitCode {
+    let root = repo_root();
+    let mut files = Vec::new();
+    for name in ["protocol", "crypto", "transport", "core", "admin", "agent"] {
+        let src = root
+            .join("crates")
+            .join(format!("stowaway-{name}"))
+            .join("src");
+        collect_rs(&src, &mut files);
+    }
+    files.sort();
+
+    const PATTERNS: [&str; 6] = [
+        "unwrap()",
+        "expect(",
+        "panic!(",
+        "todo!(",
+        "unimplemented!(",
+        "unreachable!(",
+    ];
+    let mut violations = 0usize;
+    for file in &files {
+        let text = match std::fs::read_to_string(file) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("no-panic: 读取 {} 失败：{e}", file.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        for (idx, line) in text.lines().enumerate() {
+            // `#[cfg(test)]` 之后全是测试模块，不在 DoD 范围内。
+            if line.trim() == "#[cfg(test)]" {
+                break;
+            }
+            if line.contains("// assert-ok") {
+                continue;
+            }
+            if PATTERNS.iter().any(|p| line.contains(p)) {
+                let rel = file.strip_prefix(&root).unwrap_or(file);
+                println!(
+                    "NO-PANIC      {}:{}  {}",
+                    rel.display(),
+                    idx + 1,
+                    line.trim()
+                );
+                violations += 1;
+            }
+        }
+    }
+    if violations == 0 {
+        println!("no-panic: {} 个源文件，0 处命中", files.len());
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "no-panic: {violations} 处违规（加 `// assert-ok` 说明为何恒不成立，或改用 Result）"
+        );
+        ExitCode::FAILURE
+    }
+}
+
+fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_rs(&p, out);
+        } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(p);
         }
     }
 }
