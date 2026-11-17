@@ -665,7 +665,7 @@ v2 **不读** v1 配置与持久化格式。迁移动作：重新生成 `--reuse
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo xtask doccheck                      # docs/**/*.md 的 `path:LINE` 引用全部有效
+cargo xtask doccheck                      # docs/**/*.md 的 `path:LINE` 引用全部有效（P0 前用 scripts/doccheck.sh）
 grep -rn "unwrap()\|expect(" crates/stowaway-protocol/src | grep -v "// assert-ok"   # 必须为空
 cargo geiger --workspace                  # 协议/加密/传输三 crate 的 unsafe 计数为 0
 ```
@@ -746,7 +746,7 @@ trunk-based：`master` 任何时刻可构建可测。实验/破坏性改造走 `
 
 ### G8 文档提交也门禁
 
-`docs:` 提交跳过构建，但必须过 `cargo xtask doccheck`（校验 `docs/**.md` 内所有 `path/to/file.go:LINE` 引用存在且该行非空）。P0 之前用等价 shell 脚本，P0 转成 xtask 子命令。
+`docs:` 提交跳过构建，但必须过文档引用校验（校验 `docs/**.md` 内所有 `path/to/file.go:LINE` 引用存在且该行非空）。**P0 之前用 `scripts/doccheck.sh`**（已落地，可执行）；P0 起迁移为 `cargo xtask doccheck`，两阶段行为一致。
 
 ### G9 `.gitignore`
 
