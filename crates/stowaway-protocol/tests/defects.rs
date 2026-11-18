@@ -181,7 +181,7 @@ fn defect_5_sealing_is_explicit_flag_not_uuid_inference() {
     // 只有 LAST 不算密封。
     assert!(!FrameFlags::LAST.is_sealed());
     // 未定义位必须被拒（防止对端私扩语义）。
-    for b in 0b0001_0000u8..=0xff {
+    for b in 0b10_0000u8..=0xff {
         assert!(
             FrameFlags::from_byte(b).is_err(),
             "flags=0b{b:08b} 含未定义位，必须拒绝"

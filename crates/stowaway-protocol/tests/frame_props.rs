@@ -10,7 +10,7 @@ use stowaway_protocol::node::NodeId;
 use stowaway_protocol::{MAX_FRAME, MAX_VIA, VERSION};
 
 fn any_flag_byte() -> impl Strategy<Value = u8> {
-    0u8..=0b1111u8
+    0u8..=0b1_1111u8
 }
 
 fn any_msg_type() -> impl Strategy<Value = MsgType> {

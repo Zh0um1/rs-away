@@ -35,9 +35,16 @@ impl FrameFlags {
     pub const LAST: Self = Self(0b0100);
     /// payload 内层还有 session 层 E2E 密封。
     pub const E2E: Self = Self(0b1000);
+    /// 本帧是逻辑帧的一个分片，**后面还有分片**。
+    ///
+    /// 逻辑帧载荷超过 `min(MAX_FRAME, link.max_frame)` 时由 [`crate::codec`]
+    /// 切片：除最后一片外都置位。因为 [`crate::link::Link`] 承诺「可靠有序」，
+    /// 接收方只需「见到 FRAG 就继续累积、见到不带 FRAG 的就结束」，
+    /// 不需要片序号。
+    pub const FRAG: Self = Self(0b1_0000);
 
     /// 全部已定义位。
-    pub const MASK: u8 = 0b1111;
+    pub const MASK: u8 = 0b1_1111;
 
     /// 空标志。
     #[must_use]
@@ -92,6 +99,12 @@ impl FrameFlags {
     #[must_use]
     pub const fn is_last(self) -> bool {
         self.contains(Self::LAST)
+    }
+
+    /// 是否还有后续分片。
+    #[must_use]
+    pub const fn is_fragment(self) -> bool {
+        self.contains(Self::FRAG)
     }
 
     /// 是否双层密封。
@@ -153,6 +166,14 @@ impl FrameHeader {
             w.bytes(hop.as_bytes());
         }
         w.varint(self.payload_len as u64);
+    }
+
+    /// 单独取出帧头字节（用作 AEAD 的 AAD）。
+    ///
+    /// `Frame::header_bytes` 是同一功能的帧级便捷入口。
+    #[must_use]
+    pub fn header_bytes(&self) -> Vec<u8> {
+        self.encode_to_vec()
     }
 
     /// 单独取出帧头字节（用作 AEAD 的 AAD）。
@@ -344,10 +365,11 @@ mod tests {
 
     #[test]
     fn flags_reject_undefined_bits() {
-        assert!(FrameFlags::from_byte(0b1111).is_ok());
+        // bit0..=bit4 已定义（SEALED/COMPRESSED/LAST/E2E/FRAG）。
+        assert!(FrameFlags::from_byte(0b1_1111).is_ok());
         assert_eq!(
-            FrameFlags::from_byte(0b0001_0000),
-            Err(ProtocolError::BadFlags { value: 0b0001_0000 })
+            FrameFlags::from_byte(0b10_0000),
+            Err(ProtocolError::BadFlags { value: 0b10_0000 })
         );
         assert!(FrameFlags::from_byte(0x80).is_err());
     }

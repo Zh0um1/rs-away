@@ -25,8 +25,18 @@ pub mod transport_kind;
 pub mod wire;
 
 pub use error::ProtocolError;
-pub use frame::{Frame, FrameCodec, FrameFlags};
-pub use msg::{Message, MsgType};
+pub use frame::{Frame, FrameCodec, FrameFlags, FrameHeader};
+/// 字节容器（`SessionData.data` 等字段的类型），re-export 以免下游直接依赖
+/// `serde_bytes`。
+pub use serde_bytes::ByteBuf;
+
+pub use msg::{
+    AuthConfirm, CloseReason, ConnectParam, FileParam, Heartbeat, Hello, HelloAck, Join, JoinAck,
+    Memo, Message, MsgType, NodeScope, NodeState, NodeStatus, OpenSession, Rejoin, ServiceData,
+    ServiceExit, ServiceKind, ServiceParam, ServicePhase, ServiceReply, ServiceRequest,
+    SessionClose, SessionCode, SessionData, SessionDirection, SessionKind, SessionReady,
+    ShellParam, Shutdown, SshAuth, SshParam, SshTunnelParam,
+};
 pub use node::{NodeId, NodeKind, SessionKey};
 pub use transport_kind::TransportKind;
 
