@@ -20,6 +20,7 @@
 //!
 //! P4 已实现 SOCKS5（TCP + UDP ASSOCIATE）、forward、backward、文件传输与
 //! 上游代理拨号；shell（PTY）、SSH、SSH 隧道与 `connect` 桥接见 P5。
+// 库代码禁止直接打印（由二进制/调用方决定输出方式）。
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 pub mod backward;
@@ -35,6 +36,7 @@ pub mod socks;
 pub mod socks_server;
 pub mod topology;
 pub mod udp_relay;
+pub mod upstream_proxy;
 
 pub use backward::{
     BACKWARD_PROBE_TIMEOUT, BackwardListener, BackwardSpec, dial_remote, next_open, open_message,
@@ -60,3 +62,4 @@ pub use udp_relay::{
     Datagram, MAX_UDP_DATAGRAM, UDP_IDLE_TIMEOUT_SECS, bind_outlet, needs_resolution,
     ready_message, relay_datagrams,
 };
+pub use upstream_proxy::{MAX_PROXY_RESPONSE, PROXY_DIAL_TIMEOUT, ProxySpec, dial_via_proxy};
