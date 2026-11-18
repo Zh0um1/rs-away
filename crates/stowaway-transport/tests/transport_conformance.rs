@@ -13,7 +13,6 @@ use std::io;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
-use stowaway_protocol::MAGIC;
 use stowaway_transport::{
     AnyDialer, AnyListener, DialTarget, Dialer, Link, LinkMeta, Listener, boxed,
 };
@@ -29,15 +28,6 @@ enum Kind {
 }
 
 impl Kind {
-    /// 该传输的监听端是否靠 `peek` 嗅探决定协议（只有 raw 如此）。
-    fn is_raw(self) -> bool {
-        #[cfg(feature = "transport-raw")]
-        let raw = matches!(self, Self::Raw);
-        #[cfg(not(feature = "transport-raw"))]
-        let raw = false;
-        raw
-    }
-
     fn name(self) -> &'static str {
         match self {
             #[cfg(feature = "transport-raw")]
@@ -80,16 +70,12 @@ async fn pair(kind: Kind) -> (Box<dyn Link>, Box<dyn Link>) {
             let client = tokio::spawn(async move {
                 let dialer = AnyDialer::Raw(stowaway_transport::tcp::RawDialer::new(true, None));
                 let target = DialTarget::plain(addr);
-                let mut link = dialer.connect(&target).await.expect("dial raw");
-                // 让服务端的嗅探看到 Stowaway 魔数。
-                link.write_all(&MAGIC).await.expect("write preamble");
-                link
+                // 前导由 `RawDialer::connect` 自己发出并被 `accept` 消费，
+                // 这里拿到的是可直接承载帧流的「干净」链路。
+                dialer.connect(&target).await.expect("dial raw")
             });
 
-            let (mut link, _peer) = listener.accept().await.expect("accept raw");
-            let mut preamble = [0u8; 4];
-            link.read_exact(&mut preamble).await.expect("read preamble");
-            assert_eq!(preamble, MAGIC, "前导必须被服务端原样读出");
+            let (link, _peer) = listener.accept().await.expect("accept raw");
             let client_link = client.await.expect("client join");
             (client_link, link)
         }
@@ -518,16 +504,9 @@ async fn t7_thousand_connections_do_not_leak_fds() {
                 )),
             };
             let target = DialTarget::plain(addr);
-            // raw 的服务端会 `peek` 等魔数：不等超时就必须由客户端补上，
-            // 否则每一轮都要空耗 PEEK_TIMEOUT_MS，1000 轮会拖到分钟级。
-            let is_raw = kind.is_raw();
-            let client = tokio::spawn(async move {
-                let mut link = dialer.connect(&target).await.expect("dial");
-                if is_raw {
-                    link.write_all(&MAGIC).await.expect("preamble");
-                }
-                link
-            });
+            // 前导由 `RawDialer::connect` 自己发出、由 `accept` 消费，
+            // 因此这里既不用手工补写，也不会各轮空耗 PEEK_TIMEOUT_MS。
+            let client = tokio::spawn(async move { dialer.connect(&target).await.expect("dial") });
             let (server_link, _peer) = listener.accept().await.expect("accept");
             let client_link = client.await.expect("join");
             drop(server_link);
@@ -571,7 +550,6 @@ async fn t8_thirty_two_concurrent_connections() {
                     .connect(&DialTarget::plain(addr))
                     .await
                     .expect("dial");
-                link.write_all(&MAGIC).await.expect("preamble");
                 let byte = (i % 251) as u8;
                 let chunk = vec![byte; 4096];
                 let mut left = TOTAL;
@@ -588,8 +566,6 @@ async fn t8_thirty_two_concurrent_connections() {
         for _ in 0..CONNS {
             let (mut link, _peer) = listener.accept().await.expect("accept");
             servers.push(tokio::spawn(async move {
-                let mut preamble = [0u8; 4];
-                link.read_exact(&mut preamble).await.expect("preamble");
                 let mut buf = vec![0u8; 8192];
                 let mut total = 0usize;
                 while total < TOTAL {
@@ -745,4 +721,90 @@ async fn t9_frame_layer_fragments_when_max_frame_is_small() {
         !frame.header.flags.is_fragment(),
         "重组结果的标志位不得残留 FRAG"
     );
+}
+
+// ---------------------------------------------------------------------------
+// T10：生产路径的端到端握手（raw 前导由传输层自己负责）
+// ---------------------------------------------------------------------------
+
+/// T10：`dialer_handshake` / `listener_handshake` 两个便利函数必须能直接互通。
+///
+/// 这是「生产路径」而非脚手架路径：前导由 `RawDialer::connect` 发出、
+/// 由 `RawListener::accept` 消费，调用方不应知道 `STW2` 的存在。
+#[cfg(feature = "transport-raw")]
+#[tokio::test]
+async fn t10_handshake_helpers_work_over_a_real_socket() {
+    use stowaway_crypto::Secret;
+    use stowaway_protocol::{Heartbeat, Message, NodeId, NodeKind, TransportKind};
+    use stowaway_transport::TransportSpec;
+
+    // `listener_for` 返回 `Result<impl Future>`：外层是构造，内层才是绑定。
+    let mut listener = stowaway_transport::listener_for(
+        &TransportSpec::parse("raw://127.0.0.1:0").expect("spec"),
+        None,
+    )
+    .expect("listener ctor")
+    .await
+    .expect("listener bind");
+    let addr = stowaway_transport::Listener::local_addr(&listener).expect("local_addr");
+
+    let spec = TransportSpec::parse(&format!("raw://{addr}")).expect("dial spec");
+    let server_secret = Secret::load("t10-shared-secret", 8).expect("secret");
+    let client_secret = Secret::load("t10-shared-secret", 8).expect("secret");
+
+    let server = tokio::spawn(async move {
+        let (codec, res, _peer) = stowaway_transport::listener_handshake(
+            &mut listener,
+            TransportKind::Raw,
+            None,
+            NodeKind::Admin,
+            &server_secret,
+        )
+        .await
+        .expect("listener handshake");
+        (codec, res)
+    });
+
+    let dialer = stowaway_transport::dialer_for(&spec, None).expect("dialer");
+    let (mut client_codec, client_res) = stowaway_transport::dialer_handshake(
+        &dialer,
+        &spec,
+        &DialTarget::plain(addr),
+        NodeKind::Agent,
+        &client_secret,
+    )
+    .await
+    .expect("dialer handshake");
+
+    let (mut server_codec, server_res) = server.await.expect("server join");
+
+    assert!(client_codec.is_sealed(), "客户端链路必须已密封");
+    assert!(server_codec.is_sealed(), "服务端链路必须已密封");
+    assert_eq!(client_res.peer_kind, NodeKind::Admin);
+    assert_eq!(server_res.peer_kind, NodeKind::Agent);
+    assert_eq!(
+        client_res.secrets.transcript_hash, server_res.secrets.transcript_hash,
+        "两侧 TH 必须一致"
+    );
+
+    // 握手之后双向各发一帧，确认前导没有污染帧流。
+    client_codec
+        .send(
+            &Message::Heartbeat(Heartbeat {
+                send_ts: 7,
+                echo_ts: 0,
+            }),
+            NodeId::ADMIN,
+            &[],
+        )
+        .await
+        .expect("send");
+    let (_, msg) = server_codec.recv_message().await.expect("recv");
+    assert!(matches!(
+        msg,
+        Message::Heartbeat(Heartbeat {
+            send_ts: 7,
+            echo_ts: 0
+        })
+    ));
 }

@@ -217,6 +217,10 @@ accept(TcpStream) → peek(8) →
 ```
 
 - `peek` **只取 8 字节、不消费**，避免与后续 TLS 握手抢字节（Go v1 缺陷 F10：先 `WrapTLSServerConn` 再读 token 导致嗅探失效）。
+- **前导是线上约定，不是嗅探副产物**：因为 `peek` 不消费，那 4 字节 `STW2` 在判定为 raw 之后仍留在流里。因此
+  - 拨号端 `connect` 必须在返回链路前 `write_all(MAGIC)`（TLS 时在 TLS 握手**之后**写，因为前导在 TLS 内层）；
+  - 接受端 `accept` 必须在判明 `Raw`/`Tls` 后 `read_exact` 把它读掉并核对；
+  否则 `STW2` 会作为帧版本字节进入 `LinkCodec`，表现为 `BadVersion { actual: b'S' }` 这类极难定位的握手失败。v1 没有这份前导（`protocol/raw.go:26` 的 `CNegotiate()` 是空实现），是 v2 新增的显式约定。
 - 若端口启用了 TLS（`raw+tls`），嗅探顺序为：`peek(8)` 判定 `STW2`/HTTP → 再决定是否在上面包 TLS。TLS 记录层首字节是 `0x16`，永远不会是 `S`/`G`/`P`，规则不冲突。
 
 ### 5.2 UDP 类独立端口（kcp）

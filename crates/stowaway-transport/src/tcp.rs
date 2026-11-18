@@ -6,17 +6,22 @@
 //!
 //! ```text
 //! accept → peek(8)，**不消费**
-//!   ├─ 首字节 0x16 且本端配了 TLS → 包 TLS（TLS 记录层首字节恒为 0x16）
-//!   ├─ 前缀 == "STW2"           → 明文 raw
+//!   ├─ 首字节 0x16 且本端配了 TLS → 包 TLS，握手*后*再消费前导
+//!   ├─ 前缀 == "STW2"           → 明文 raw，随即消费掉这 4 字节前导
 //!   └─ 其它                      → ReuseFallback（交调用方做端口复用回落/关闭）
 //! ```
+//!
+//! **前导是线上约定，不是嗅探副产物**：`peek` 只取不消费，所以拨号端必须先显式
+//! `write_all(MAGIC)`，接受端在判明 `Raw`/`Tls` 后显式 `read_exact` 把它吃掉，
+//! 否则这 4 字节会留在流里被上层当成帧头（v1 没有这份前导，`protocol/raw.go:26`
+//! 的 `CNegotiate()` 是空实现）。
 
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use stowaway_protocol::{MAGIC, TransportKind};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{Result, TransportError};
@@ -186,7 +191,9 @@ impl Listener for RawListener {
                         crate::error::invalid_input("服务端 TLS 配置缺失（监听端未派发证书）")
                     })?;
                     let acceptor = tokio_rustls::TlsAcceptor::from(server);
-                    let tls_stream = acceptor.accept(stream).await?;
+                    let mut tls_stream = acceptor.accept(stream).await?;
+                    // 前导在 TLS 内层：握手完成后才读得到，读掉再交给上层。
+                    consume_preamble(&mut tls_stream).await?;
                     return Ok((
                         crate::link::boxed(RawLink::new(tls_stream, peer, TransportKind::Raw)),
                         peer,
@@ -201,6 +208,10 @@ impl Listener for RawListener {
             }
 
             if protocol == crate::sniff::Protocol::Raw {
+                // `peek` 不消费：这 4 字节前导仍在流里，必须显式读掉，
+                // 否则上层会把 `STW2` 当成帧版本字节。
+                let mut stream = stream;
+                consume_preamble(&mut stream).await?;
                 return Ok((
                     crate::link::boxed(RawLink::new(stream, peer, TransportKind::Raw)),
                     peer,
@@ -256,7 +267,11 @@ impl Dialer for RawDialer {
                 let name = rustls::pki_types::ServerName::try_from(sni.clone())
                     .map_err(|_| crate::error::invalid_input(format!("非法 SNI：{sni}")))?;
                 let connector = tokio_rustls::TlsConnector::from(config);
-                let tls_stream = connector.connect(name, stream).await?;
+                let mut tls_stream = connector.connect(name, stream).await?;
+                // 前导写在 TLS 内层：必须先完成握手。它是线上约定的一部分，
+                // 服务端靠它把本连接判定为 Stowaway 流量。
+                tls_stream.write_all(&MAGIC).await?;
+                tls_stream.flush().await?;
                 return Ok(crate::link::boxed(RawLink::new(
                     tls_stream,
                     target.addr,
@@ -272,6 +287,10 @@ impl Dialer for RawDialer {
                 }));
             }
 
+            // 明文：连上就先自报家门，服务端 `peek` 才有东西可看。
+            let mut stream = stream;
+            stream.write_all(&MAGIC).await?;
+            stream.flush().await?;
             Ok(crate::link::boxed(RawLink::new(
                 stream,
                 target.addr,
@@ -279,6 +298,24 @@ impl Dialer for RawDialer {
             )))
         }
     }
+}
+
+/// 读掉 4 字节 `MAGIC` 前导（接受端专用）。
+///
+/// `peek` 只取不消费，所以判定为 raw 之后必须显式读掉，
+/// 否则 `STW2` 会作为帧版本字节进到 [`crate::LinkCodec`] 里，
+/// 表现为 `BadVersion { actual: b'S' }` 这种极难定位的握手失败。
+async fn consume_preamble<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<()> {
+    let mut got = [0u8; MAGIC.len()];
+    stream.read_exact(&mut got).await?;
+    if got != MAGIC {
+        return Err(crate::error::invalid_input(format!(
+            "前导不匹配：期望 {}，实际 {}",
+            crate::sniff::hex_preview(&MAGIC),
+            crate::sniff::hex_preview(&got)
+        )));
+    }
+    Ok(())
 }
 
 /// 应用 `TCP_NODELAY` / `SO_KEEPALIVE`（v1 全仓零命中，见 plan §2.10）。
@@ -345,18 +382,19 @@ mod tests {
             let dialer = RawDialer::new(true, None);
             let target = DialTarget::plain(addr);
             let mut link = dialer.connect(&target).await.expect("connect");
-            // 客户端先发握手首字节，服务端靠 peek 判定为 raw。
-            tokio::io::AsyncWriteExt::write_all(&mut link, &MAGIC)
+            // 前导由 `connect` 自己发出并被 `accept` 消费，这里直接写业务字节：
+            // 若前导泄漏到链路里，读到的一定不是 payload。
+            tokio::io::AsyncWriteExt::write_all(&mut link, b"payload")
                 .await
                 .expect("write");
         });
 
         let (mut link, _peer) = listener.accept().await.expect("accept");
-        let mut buf = [0u8; 4];
+        let mut buf = [0u8; 7];
         tokio::io::AsyncReadExt::read_exact(&mut link, &mut buf)
             .await
             .expect("read");
-        assert_eq!(buf, MAGIC);
+        assert_eq!(&buf, b"payload", "前导必须已被 accept 消费掉");
         assert_eq!(link.meta().kind, TransportKind::Raw);
         client.await.expect("client join");
     }
