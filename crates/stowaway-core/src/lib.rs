@@ -34,6 +34,7 @@ pub mod session_stream;
 pub mod socks;
 pub mod socks_server;
 pub mod topology;
+pub mod udp_relay;
 
 pub use backward::{
     BACKWARD_PROBE_TIMEOUT, BackwardListener, BackwardSpec, dial_remote, next_open, open_message,
@@ -55,3 +56,7 @@ pub use socks_server::{
     dial_target, negotiate, pump, relay, serve_connect, wait_ready,
 };
 pub use topology::{NodeMeta, RouteEntry, Topology};
+pub use udp_relay::{
+    Datagram, MAX_UDP_DATAGRAM, UDP_IDLE_TIMEOUT_SECS, bind_outlet, needs_resolution,
+    ready_message, relay_datagrams,
+};
