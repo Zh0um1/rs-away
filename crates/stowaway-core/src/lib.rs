@@ -32,6 +32,7 @@ pub mod link_actor;
 pub mod node;
 pub mod session;
 pub mod session_stream;
+pub mod shell;
 pub mod socks;
 pub mod socks_server;
 pub mod topology;
@@ -63,3 +64,12 @@ pub use udp_relay::{
     ready_message, relay_datagrams,
 };
 pub use upstream_proxy::{MAX_PROXY_RESPONSE, PROXY_DIAL_TIMEOUT, ProxySpec, dial_via_proxy};
+
+// P5 服务。`open_message` 在 backward / shell / ssh / bridge 各有一份，语义
+// 相同（都构造 `ServiceRequest`）但类型不同，故不在 crate 根重导出，调用方
+// 按模块路径引用（`shell::open_message` 等），避免命名冲突掩盖了类型差异。
+pub use shell::{
+    Charset, DEFAULT_TERM, PtySession, SHELL_READ_BUF, SHELL_TAG_DATA, SHELL_TAG_RESIZE,
+    ShellCodec, ShellError, ShellFrame, ShellSpec, data_message, default_shell, parse_frame,
+    resize_message, spawn,
+};
