@@ -17,6 +17,10 @@ tls = [
     "dep:rustls-pki-types",
     "dep:rcgen",
     "dep:p256",
+    "dep:hkdf",
+    "dep:sha2",
+    "dep:zeroize",
+    "dep:x509-parser",
 ]
 
 [dependencies]
@@ -34,7 +38,18 @@ rustls-pki-types = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+x509-parser = { workspace = true, optional = true }
 tokio_kcp = { version = "0.9.8", optional = true }
+
+[dev-dependencies]
+# 一致性闸门（`tests/transport_conformance.rs`）需要在**任意 feature 组合**下
+# 都能编译：`tls` 关掉时 `sha2` 不再是常规依赖，而闸门要用它算 10 MiB 校验和；
+# `socket2` 则用于制造真 RST。因此这两个必须无条件进 dev-dependencies。
+sha2 = { workspace = true }
+socket2 = { workspace = true }
 
 [lints]
 workspace = true

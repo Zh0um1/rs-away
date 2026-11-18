@@ -2855,10 +2855,12 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures-util",
+ "hkdf",
  "p256",
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "sha2",
  "socket2",
  "stowaway-crypto",
  "stowaway-protocol",
@@ -2868,6 +2870,8 @@ dependencies = [
  "tokio-tungstenite",
  "tokio_kcp",
  "tracing",
+ "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
