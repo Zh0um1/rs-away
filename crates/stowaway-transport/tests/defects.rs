@@ -285,3 +285,80 @@ fn defect_link_meta_matches_transport_kind() {
         "with_max_frame 必须生效"
     );
 }
+
+/// 缺陷 #8：v1 的 `crypto/gzip.go:23` 在解压失败时 `return dst`（空切片），
+/// 坏数据于是变成「空载荷」继续往下走。v2 的压缩位是预留位，收到带压缩位
+/// 的帧必须**显式拒绝**，绝不把未解压的字节当载荷交出去。
+#[tokio::test]
+async fn defect_8_compressed_flag_is_rejected_not_silently_emptied() {
+    use stowaway_transport::LinkCodec;
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+
+    struct PlainLink {
+        inner: tokio::io::DuplexStream,
+        meta: LinkMeta,
+    }
+
+    impl AsyncRead for PlainLink {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for PlainLink {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            data: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, data)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl Link for PlainLink {
+        fn meta(&self) -> LinkMeta {
+            self.meta.clone()
+        }
+    }
+
+    let (mut peer, reader_side) = tokio::io::duplex(64 * 1024);
+    let meta = LinkMeta::new(stowaway_protocol::TransportKind::Raw, None);
+    let mut reader = LinkCodec::new(boxed(PlainLink {
+        inner: reader_side,
+        meta,
+    }));
+
+    // 手工造一个带 COMPRESSED 位的合法帧（未密封，便于直接走到压缩判定）。
+    let frame = Frame::new(
+        FrameFlags::COMPRESSED,
+        MsgType::Heartbeat,
+        NodeId::ADMIN,
+        Vec::new(),
+        b"not-really-gzip".to_vec(),
+    );
+    peer.write_all(&frame.encode()).await.expect("write");
+
+    let err = reader.recv().await.expect_err("压缩帧必须报错");
+    assert!(
+        err.to_string().contains("压缩"),
+        "错误必须指出压缩位：{err}"
+    );
+}

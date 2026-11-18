@@ -425,6 +425,15 @@ impl LinkCodec {
         loop {
             let physical = self.read_physical_frame().await?;
             let logical = self.unseal(physical)?;
+            // 压缩位在 v2 里是**预留**（默认关闭、无实现）。收到带压缩位的帧
+            // 必须显式拒绝：v1 的 `crypto/gzip.go:23` 在解压失败时静默返回空
+            // 切片（缺陷 #8），让坏数据变成「空载荷」继续往下走。这里宁可
+            // 断链，也不把未解压的字节当载荷交出去。
+            if logical.header.flags.contains(FrameFlags::COMPRESSED) {
+                return Err(TransportError::Protocol(ProtocolError::Payload(
+                    "帧带压缩位，但 v2 未实现压缩（gzip 缺陷 #8 的显式拒绝）".to_owned(),
+                )));
+            }
             if logical.header.flags.is_fragment() {
                 self.push_fragment(&logical)?;
                 continue;
