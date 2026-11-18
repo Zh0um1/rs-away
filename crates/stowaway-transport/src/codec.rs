@@ -28,8 +28,8 @@ use stowaway_crypto::{
     ClientHandshake, HandshakeOutcome, HandshakeSecrets, LinkSealer, Secret, ServerHandshake,
 };
 use stowaway_protocol::{
-    FRAGMENT_MAX, Frame, FrameFlags, FrameHeader, MAX_FRAME, Message, MsgType, NodeId,
-    ProtocolError,
+    FRAGMENT_MAX, Frame, FrameFlags, FrameHeader, MAX_FRAME, MAX_HEADER_LEN, Message, MsgType,
+    NodeId, ProtocolError,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -294,6 +294,52 @@ impl LinkCodec {
         flags: FrameFlags,
         payload: &[u8],
     ) -> Result<()> {
+        let mut out = Vec::with_capacity(payload.len() + SEAL_OVERHEAD + MAX_HEADER_LEN);
+        self.append_payload(msg_type, dest, via, flags, payload, &mut out)?;
+        self.link.write_all(&out).await?;
+        self.link.flush().await?;
+        Ok(())
+    }
+
+    /// 把一条消息编码进 `out`（自动分片、自动密封），**不写链路、不 flush**。
+    ///
+    /// 供 [`LinkActor`](crate::link_actor::LinkActor) 做批量发送：把多条消息
+    /// 攒进同一个 `Vec<u8>`，达到 64 KiB 或 4 ms 阈值后一次 `write_all`，
+    /// 而不是「一条消息一次系统调用」（v1 的每帧一次写）。
+    ///
+    /// # Errors
+    /// 载荷编码失败、计数器耗尽。
+    pub fn append_message(
+        &mut self,
+        msg: &Message,
+        dest: NodeId,
+        via: &[NodeId],
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let payload = msg.encode()?;
+        self.append_payload(
+            msg.msg_type(),
+            dest,
+            via,
+            FrameFlags::empty(),
+            &payload,
+            out,
+        )
+    }
+
+    /// 同上，但由调用方给出已编码载荷与标志（`LAST`/`E2E` 等）。
+    ///
+    /// # Errors
+    /// 计数器耗尽。
+    pub fn append_payload(
+        &mut self,
+        msg_type: MsgType,
+        dest: NodeId,
+        via: &[NodeId],
+        flags: FrameFlags,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         let chunk = self.max_chunk();
         let mut rest = payload;
         loop {
@@ -304,8 +350,7 @@ impl LinkCodec {
             if more {
                 frag_flags.insert(FrameFlags::FRAG);
             }
-            self.write_frame_payload(msg_type, dest, via, frag_flags, this)
-                .await?;
+            self.encode_frame_payload(msg_type, dest, via, frag_flags, this, out)?;
             if !more {
                 break;
             }
@@ -313,19 +358,19 @@ impl LinkCodec {
         }
         // 空载荷也会走一次循环体（`take == 0`），因此「空帧」必然写出，
         // 对端不会因为零长消息而卡在等帧上。
-        self.link.flush().await?;
         Ok(())
     }
 
-    async fn write_frame_payload(
+    fn encode_frame_payload(
         &mut self,
         msg_type: MsgType,
         dest: NodeId,
         via: &[NodeId],
         flags: FrameFlags,
         plaintext: &[u8],
+        out: &mut Vec<u8>,
     ) -> Result<()> {
-        let frame = match self.sealer.as_mut() {
+        let (header, payload) = match self.sealer.as_mut() {
             Some(sealer) => {
                 let mut sealed_flags = flags;
                 sealed_flags.insert(FrameFlags::SEALED);
@@ -339,15 +384,34 @@ impl LinkCodec {
                 let mut payload = Vec::with_capacity(total);
                 payload.extend_from_slice(&counter.to_le_bytes());
                 payload.extend_from_slice(&ct);
-                Frame {
-                    header,
-                    payload: Bytes::from(payload),
-                }
+                (header, payload)
             }
-            None => Frame::new(flags, msg_type, dest, via.to_vec(), plaintext.to_vec()),
+            None => {
+                let mut header = FrameHeader::new(flags, msg_type, dest, via.to_vec());
+                header.payload_len = plaintext.len();
+                (header, plaintext.to_vec())
+            }
         };
-        let bytes = frame.encode();
-        self.link.write_all(&bytes).await?;
+        // 直接拼进调用方的缓冲，避免「每帧一次分配 + 一次 write 系统调用」。
+        out.extend_from_slice(&header.encode_to_vec());
+        out.extend_from_slice(&payload);
+        Ok(())
+    }
+
+    /// 把已编码的一批字节写出并 flush（批量发送用）。
+    ///
+    /// 与 [`Self::send_payload`] 的区别：不重新编码，只负责「一次系统调用
+    /// 写出整批」（v1 是每帧一次 `Write`）。
+    ///
+    /// # Errors
+    /// 链路写失败。
+    pub async fn write_batch(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        self.link.write_all(out).await?;
+        self.link.flush().await?;
+        out.clear();
         Ok(())
     }
 
@@ -498,9 +562,9 @@ fn try_take_frame(buf: &mut BytesMut) -> Result<Option<Frame>> {
         Ok(v) => v,
         Err(ProtocolError::Truncated { .. }) => {
             // 帧头还没到齐；但若缓冲已超过理论头部上限，说明对端在灌垃圾。
-            if buf.len() > stowaway_protocol::MAX_HEADER_LEN {
+            if buf.len() > MAX_HEADER_LEN {
                 return Err(TransportError::Protocol(ProtocolError::Truncated {
-                    need: stowaway_protocol::MAX_HEADER_LEN,
+                    need: MAX_HEADER_LEN,
                     have: buf.len(),
                     field: "header",
                 }));
