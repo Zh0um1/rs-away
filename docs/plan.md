@@ -395,7 +395,7 @@ S → C  Ready       （隐含：AuthConfirm 校验通过后开始收帧）
 | 族 | 消息 | 说明 |
 |---|---|---|
 | Link（5） | `Hello` / `HelloAck` / `AuthConfirm` / `Heartbeat` / `Shutdown` | 建链、保活（带 `send_ts`、`echo_ts` 用于 RTT）、全局关停 |
-| Topology（5） | `Join` / `JoinAck` / `Rejoin` / `NodeStatus` / `Memo` | `Join` 申请 UUID（取代 `CHILDUUIDREQ`）；`NodeStatus{scope: Node\|Upstream\|Child, state: Online\|Offline, node}` 统一 v1 的 4 条 offline/online 消息 |
+| Topology（5） | `Join` / `JoinAck` / `Rejoin` / `NodeStatus` / `Memo` | `Join{node}` 双重用途（取代 `CHILDUUIDREQ` 与 v1 `UUID` 查询）：`node == UNASSIGNED` 表示发送方自己入网申请编号；`node` 具体表示发送方**代子公告**（父节点是发送方）；`NodeStatus{scope: Node\|Upstream\|Child, state: Online\|Offline, node}` 统一 v1 的 4 条 offline/online 消息 |
 | Session（4） | `OpenSession` / `SessionReady` / `SessionData` / `SessionClose` | `OpenSession{kind, direction, target, ...}` 双向可用；`SessionReady{code}` 承载成功/错误；`SessionData{seq, flags}`；`SessionClose{reason}` |
 | Service（4） | `ServiceRequest` / `ServiceReply` / `ServiceData` / `ServiceExit` | 文件、shell、ssh、sshtunnel、connect 五类共用；`ServiceRequest{kind, phase: Probe\|Run, ...}` 保留 v1 的 `FORWARDTEST`/`BACKWARDTEST` 探测语义 |
 
@@ -416,6 +416,7 @@ S → C  Ready       （隐含：AuthConfirm 校验通过后开始收帧）
 - `route_cache` 由拓扑计算（admin 独占）与「本节点子链路表」共同填充；**每条链路建立/断开时 `epoch += 1` 并整体失效**，避免 v1 的口径漂移。
 - 中间节点**不解 session 层**（E2E 时只见密文），只解 link 层做路由与限速。
 - 不产生逐帧 topology 往返（对比 §2.9）：下一跳在会话建立时缓存到 `Session` 元数据里。
+- **拓扑收敛的主动通告**：v2 帧没有 `sender` 字段（派发时的 `from` 只是链路对端），因此子节点新接入时必须由**父节点**立刻向上游发一条代子公告（`Join{node: <child>}`），逐跳上传到 admin。否则 admin 要等该子节点自己的心跳跨两跳到达才知道它存在，而那时也拿不到父子关系——这期间任何指向它的帧都会被判为不可达。公告只影响「登记谁」，父节点恒为链路对端，所以上游无法伪造 `node` 把别人的子树劫持到自己名下。
 - **不可达不再静默**：v1 的 `route` 为空时直接丢弃；v2 必回 `NodeStatus{Undeliverable}` 供控制台与 `bisect` 使用。
 
 ### 4.8 会话模型
@@ -816,7 +817,7 @@ P0 起每 push 跑：`fmt --check` / `clippy --workspace --all-targets --all-fea
 |---|---|---|---|
 | 1 | `HI` | `Hello` + `HelloAck` | 拆分方向；携带 `version`/`role`/`transport_kind`/`tls_fp` |
 | 2 | `UUID` | `JoinAck` | UUID 查询被并入 `Join`/`JoinAck` 的 `assigned_node` 字段 |
-| 3 | `CHILDUUIDREQ` | `Join` | 子节点申请 `NodeId`；父节点扮演 admin 时改写为「代子申请」 |
+| 3 | `CHILDUUIDREQ` | `Join` | 子节点申请 `NodeId`（`Join.node = UNASSIGNED`）；父节点扮演 admin 时改写为「代子申请」；另有 `Join.node = <child>` 的**代子公告**用法，用于子节点接入瞬间让所有上游补齐拓扑 |
 | 4 | `CHILDUUIDRES` | `JoinAck` | 分配结果 + 父节点 `NodeId` + 深度 |
 | 5 | `MYINFO` | `Join`（`info` 字段） | 身份信息随 `Join` 上报（主机名/用户名/OS/架构），无独立消息 |
 | 6 | `MYMEMO` | `Memo` | 保留（控制台 `addmemo`/`delmemo` 依赖） |
