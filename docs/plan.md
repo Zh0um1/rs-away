@@ -532,6 +532,10 @@ pub enum SessionDirection { Outbound, Inbound }   // 相对**接收方**：Outbo
 | E10 | §4.5 secret 长度下限 8 | 一致；README 的 `-s 123` 需 `--allow-weak-secret` | 保持兼容但显式告警 |
 | E11 | §4.11 magic 由 secret 派生 | 改为 `--reuse-magic` **安装期随机 16 字符**（缺省才回落派生） | 派生值是 secret 的函数，泄露 magic 等于给离线爆破一个已知明文 |
 | E12 | §4.10 admin 侧 `-csrf`/`-heartbeat` 等 CLI | 见 §6 映射表；`-heartbeat` 语义改为双向 + RTT | v1 的心跳是单向且 agent 侧 `case HEARTBEAT` 为空分支 |
+| E13 | §4.4 shell 数据帧 = v1 `SHELLRESULT{ResultLen,Result}` 原样搬 | 所有 shell 数据帧首字节都是标签：`0x00` 终端数据、`0x01` resize（后跟 `cols u16 LE ‖ rows u16 LE`） | v1 完全没有 resize 消息，而 PTY 升级后必须能改窗口尺寸；**所有帧都带标签**（而不是只给控制帧加）是为了避免首字节恰为 `0x01` 的普通输出被误判成控制帧 |
+| E14 | §5.1 raw 靠 `peek` 判 `STW2` 即可 | **前导成为线上显式约定**：拨号端 `connect` 先 `write_all(MAGIC)`，接受端判明 raw/TLS 后 `read_exact` 消费并核对 | `peek` 只取不消费，4 字节会残留进 `LinkCodec` 被当帧版本字节（`BadVersion { actual: b'S' }`）。v1 无此前导（`protocol/raw.go:26` 的 `CNegotiate()` 是空实现），属 v2 新增 |
+| E15 | §5.1#10「SSH 可配 known_hosts」 | 默认 `HostKeyPolicy::Strict`；`AcceptAndLearn` 需显式选；`Insecure` 需显式开启。比对前先 `strip_comment()` | `russh` 的 `check_known_hosts_path` 用整个 `PublicKey` 的 `PartialEq`，把 `comment` 也算进去，而 known_hosts 只存 base64——不剥注释会把「同 key 不同注释」误判成 `KeyChanged` |
+| E16 | §4.6 Service 族 | `sshtunnel` 与 `connect` 合并为 `stowaway_core::bridge`；桥接时本端扮 `NodeKind::Admin` | v1 两者共用同一套「伪 admin 握手 + 子节点登记」，唯一区别是底层通路（SSH direct-tcpip vs 裸 TCP/TLS）；`opposite(role)` 校验要求对端必须是 Agent |
 
 ---
 
