@@ -25,6 +25,7 @@
 pub mod backward;
 pub mod dispatch;
 pub mod error;
+pub mod file;
 pub mod forward;
 pub mod link_actor;
 pub mod node;
@@ -40,6 +41,7 @@ pub use backward::{
 };
 pub use dispatch::{Route, decide, undeliverable_status};
 pub use error::{CoreError, Result};
+pub use file::{FILE_CHUNK, FileError, IncomingFile, safe_join, validate_name};
 pub use forward::{
     CommittedForward, Direction, ForwardSpec, PROBE_TIMEOUT, describe, probe, stop_message,
 };
