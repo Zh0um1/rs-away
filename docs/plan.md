@@ -21,7 +21,7 @@
 | D3 | 全平台对等，但构建矩阵分 `blocking` / `best-effort` 两档 | Go 版 Makefile 实测只有 11 个 OS-ARCH 组合；tier-3 目标需 `-Z build-std`，不能与 tier-1 同等待遇 |
 | D4 | 传输层可插拔：`raw` / `ws` 随 v2 发布，`kcp` 走 feature 预留，`quic` 仅占位 | 见 `docs/design/transport.md` |
 | D5 | 帧层永远密封；TLS 只是可选外壳，关闭 TLS 不影响载荷加密 | 修正缺陷 #5：`--tls-enable` 时把 `Secret` 置空导致载荷明文 |
-| D6 | secret 支持非 argv 来源；TLS 证书确定性派生 | 修正缺陷 #7（静态明文 token）与 #6（RSA-1024 + `InsecureSkipVerify`） |
+| D6 | secret 支持非 argv 来源；TLS 私钥确定性派生（指纹绑 SPKI，重启不变） | 修正缺陷 #7（静态明文 token）与 #6（RSA-1024 + `InsecureSkipVerify`） |
 | D7 | **小步提交 + 阶段里程碑 tag + 提交信息溯源到本文档章节/缺陷号；`master` 任何时刻可构建** | 便于溯源与恢复，见 §10 |
 
 **文档维护规则**
@@ -236,7 +236,7 @@ Data        [DataLen bytes]   ← 长度是密文长度
 | 3 | `DataLen` 为 u64 且无上限 → `make([]byte, header.DataLen)` | `protocol/raw.go:149` | 单帧声明超大长度 | **内存耗尽 DoS** | 帧层 `payload_len <= MAX_FRAME`（1 MiB），越界即断链 |
 | 4 | 长度字段直接用于切片 `dataBuf[ptr:ptr+n]` | `protocol/raw.go:297-319` | 长度字段大于实际数据 | **panic** | 解码全程用 `checked_add` + 剩余长度校验；属性测试 |
 | 5 | `--tls-enable` 时把 `Secret` 置空 → **载荷加密完全关闭** | `agent/initial/method.go:82-93`、`:184`、`:333`；`admin/initial/method.go:90`、`:213` | 用户开启 TLS | 与 `InsecureSkipVerify` 叠加 → **等同明文** | 帧层密封与 TLS 解耦（D5）；TLS 开关不影响 `Secret`；**且改的是共享 `options`（F11）→ 被动侧每 accept 一次即污染后续所有连接** |
-| 6 | TLS 恒 `InsecureSkipVerify = true` + RSA-1024 自签 + 每次重启换指纹 | `share/transport/tls.go:113`、`tls.go:23`、`:65-88` | 任何时候 | **MITM 可完全透明代理**（不写成「任何人可解载荷」；载荷另有 AES 层） | 证书由 `HKDF(secret, "tls-cert")` 确定性派生（同 secret 重启用同一指纹）；客户端默认校验指纹（`--tls-pin` / known_hosts 式 TOFU 持久化） |
+| 6 | TLS 恒 `InsecureSkipVerify = true` + RSA-1024 自签 + 每次重启换指纹 | `share/transport/tls.go:113`、`tls.go:23`、`:65-88` | 任何时候 | **MITM 可完全透明代理**（不写成「任何人可解载荷」；载荷另有 AES 层） | 证书私钥由 `HKDF(secret, "tls-cert-key")` 确定性派生 → **同 secret 恒同公钥/SPKI**，指纹绑定 SPKI 故重启不变（证书 DER 因 ECDSA 签名随机化每次可不同，不影响 pin）；客户端默认校验指纹（`--tls-pin` / known_hosts 式 TOFU 持久化） |
 | 7 | 预认证 token 明文、静态、可重放；`token = MD5(secret)[:16]` | `share/preauth.go:15,26`、`crypto` 层 | 抓包 | 真实危害是**重放** + 用垃圾帧触发 #2 的远程 panic；`MD5(secret)[:16]` 同时是**离线字典验证器**（拿到 token 即可暴破 secret），但**仅持 token 不足以构造合法 GCM 帧** | 3-flight 握手 + 挑战应答 + `proof = HMAC(auth_key, TH‖role)` + 时间窗与单调 counter（§4.5） |
 | 8 | `gzip` 解压失败静默返回空 | `crypto/gzip.go:23` | 数据损坏 | 静默丢数据，是 #2 的放大器 | 解压失败 `Err`；压缩默认关闭（见 §4.4 flags 预留） |
 | 9 | `aes.NewCipher` / `cipher.NewGCM` 错误被忽略 | `crypto/aes.go:41-42` | 异常密钥长度 | panic | 密钥长度在类型层固定（`[u8; 32]`），构造期即校验 |
@@ -556,7 +556,7 @@ pub enum SessionKind { Socks5, Socks5Udp, Forward, Backward, File, ShellPty, Ssh
 | `process_win.go` 重复分发器 | 平台无关代码统一 |
 | termbox / ansicon | `ratatui` |
 | `MD5` 全部用途 | 改 SHA-256/HKDF（`MD5(secret)[:16]` 已被 #7 判定为离线验证器） |
-| `RSA-1024` 自签 | `P-256` + 确定性派生 |
+| `RSA-1024` 自签 | `P-256` + 私钥确定性派生（指纹绑 SPKI） |
 | `InsecureSkipVerify = true` | 指纹校验 + TOFU |
 | `math/rand` 随机串 | `rand::rngs::OsRng` |
 | `utils.CheckRange` 冒泡 | 直接范围校验 |

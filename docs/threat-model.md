@@ -76,7 +76,7 @@
 ### T-6 TLS 降级与不可信证书（对应缺陷 #5、#6，A2）
 
 - **v1 现状**：`--tls-enable` 时 `Secret = ""`（**载荷加密被关闭**）；客户端 `InsecureSkipVerify = true`；RSA-1024 自签、每次重启换指纹。
-- **v2 对策**：帧层密封与 TLS 解耦（关 TLS 不影响载荷加密）；证书由 `HKDF(secret,"tls-cert")` **确定性派生**（同 secret 重启用同一指纹）；客户端默认校验指纹（`--tls-pin sha256:<hex>` 或 `<download>/known_hosts` 式 TOFU 持久化）。
+- **v2 对策**：帧层密封与 TLS 解耦（关 TLS 不影响载荷加密）；证书私钥由 `HKDF(secret,"tls-cert-key")` **确定性派生**（同 secret 恒同公钥/SPKI，指纹对 SPKI 取哈希故重启不变；证书 DER 因签名随机化可变但不影响 pin）；客户端默认校验指纹（`--tls-pin sha256:<hex>` 或 `<download>/known_hosts` 式 TOFU 持久化）。
 - **残余**：TOFU 首次连接无法防 MITM（与 SSH 同性质）；`--tls-pin` 未配置且无 known_hosts 时必须显式 `--tls-tofu` 才降级。
 - **回归测试**：`defect_5_`、`defect_6_`；`--tls` 下 payload 仍被密封（`flags.SEALED` 恒为 1）。
 

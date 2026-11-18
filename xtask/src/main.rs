@@ -138,9 +138,11 @@ fn run_no_panic() -> ExitCode {
     }
     files.sort();
 
+    // `expect(` 必须带前导点：否则 `fn recv_expect(` 这类**名字里含 expect** 的
+    // 正常函数定义会被误报（P2 实际踩到）。
     const PATTERNS: [&str; 6] = [
         "unwrap()",
-        "expect(",
+        ".expect(",
         "panic!(",
         "todo!(",
         "unimplemented!(",

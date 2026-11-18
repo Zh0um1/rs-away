@@ -49,7 +49,7 @@
 └────────────────────────────────────────────────────────────┘
 ```
 
-**关键点**：`LinkSealer` 在 `Link` 之上，因此**加密与传输解耦**。TLS 是可选外壳，嵌在 `Link` 实现内部（`raw+`tls` → `rustls` 包一层 `TcpStream`；`ws+`tls` → `tokio-tungstenite` 的 `Connector`）。这意味着「换传输」不触碰密码学，「关 TLS」不影响帧层密封（修正 Go v1 缺陷 #5：`--tls-enable` 时把 `Secret` 置空导致载荷明文）。
+**关键点**：`LinkSealer` 在 `Link` 之上，因此**加密与传输解耦**。TLS 是可选外壳，嵌在 `Link` 实现内部（`raw+`tls` → `rustls` 包一层 `TcpStream`；`ws+`tls` → 先自建 `rustls` 连接，再把 `TlsStream` 交给 `client_async`）。这意味着「换传输」不触碰密码学，「关 TLS」不影响帧层密封（修正 Go v1 缺陷 #5：`--tls-enable` 时把 `Secret` 置空导致载荷明文）。
 
 ---
 
@@ -242,9 +242,9 @@ KCP 是 UDP，无法与 TCP 共端口，规则：
 | 组合 | v2 状态 | 实现 | 备注 |
 |---|---|---|---|
 | `raw` + 明文 | ✅ 默认 | `TcpStream` 直接作为 `Link` | 帧层仍密封，明文只指「外层无 TLS」 |
-| `raw` + TLS | ✅ | `tokio-rustls` + 确定性自签证书（plan.md §4.8） | 指纹进 TH，可 `--tls-pin` |
+| `raw` + TLS | ✅ | `tokio-rustls` + 确定性自签证书（plan.md §4.8） | 指纹（口径 **SPKI**，同 secret 恒同公钥；证书 DER 因签名随机化可变）进 TH，可 `--tls-pin` |
 | `ws` + 明文 | ✅ | `tokio-tungstenite` + `WsLink` 适配层 | 过 NGINX/CDN 场景 |
-| `ws` + TLS | ✅ | `tokio-tungstenite` 的 `Connector` | 即 wss；`-domain` 同时用于 SNI 与 Host |
+| `ws` + TLS | ✅ | 自建 `rustls` 连接后 `client_async`（**不用 `Connector`**：本仓 `tokio-tungstenite` 只开 `handshake` feature） | 即 wss；`-domain` 同时用于 SNI 与 Host |
 | `kcp` + 明文 | ✅（feature 开启时） | `tokio_kcp` | 帧层密封已足够；KCP 自带 FEC/重传 |
 | `kcp` + TLS | ❌ | — | 需 DTLS，v2 不做（用「帧层密封 + KCP」替代） |
 | `quic` | ❌ 占位 | — | QUIC 自带 TLS1.3，接入时需重新审视 TH 绑定 |
