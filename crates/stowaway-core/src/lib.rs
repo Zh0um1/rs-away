@@ -22,8 +22,10 @@
 //! 上游代理拨号；shell（PTY）、SSH、SSH 隧道与 `connect` 桥接见 P5。
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+pub mod backward;
 pub mod dispatch;
 pub mod error;
+pub mod forward;
 pub mod link_actor;
 pub mod node;
 pub mod session;
@@ -32,8 +34,15 @@ pub mod socks;
 pub mod socks_server;
 pub mod topology;
 
+pub use backward::{
+    BACKWARD_PROBE_TIMEOUT, BackwardListener, BackwardSpec, dial_remote, next_open, open_message,
+    relay_backward,
+};
 pub use dispatch::{Route, decide, undeliverable_status};
 pub use error::{CoreError, Result};
+pub use forward::{
+    CommittedForward, Direction, ForwardSpec, PROBE_TIMEOUT, describe, probe, stop_message,
+};
 pub use link_actor::{LINK_BATCH_BYTES, LINK_BATCH_MS, LinkActor, LinkCommand};
 pub use node::{Node, NodeConfig};
 pub use session::{SESSION_QUEUE_DEPTH, SessionMeta, SessionState, SessionTable};
