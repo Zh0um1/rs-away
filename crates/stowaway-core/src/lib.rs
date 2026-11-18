@@ -35,6 +35,7 @@ pub mod session_stream;
 pub mod shell;
 pub mod socks;
 pub mod socks_server;
+pub mod ssh;
 pub mod topology;
 pub mod udp_relay;
 pub mod upstream_proxy;
@@ -72,4 +73,10 @@ pub use shell::{
     Charset, DEFAULT_TERM, PtySession, SHELL_READ_BUF, SHELL_TAG_DATA, SHELL_TAG_RESIZE,
     ShellCodec, ShellError, ShellFrame, ShellSpec, data_message, default_shell, parse_frame,
     resize_message, spawn,
+};
+pub use ssh::{
+    CommandOutput, DEFAULT_SSH_PORT, HostKeyDecision, HostKeyPolicy, HostKeyReject,
+    HostKeyVerifier, KnownState, SSH_COMMAND_TIMEOUT, SSH_CONNECT_TIMEOUT, SshConnection, SshError,
+    SshShell, SshSpec, connect, decide_host_key, load_known_host_key, open_shell, open_tunnel,
+    pump_channel, run_command,
 };
