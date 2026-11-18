@@ -408,3 +408,141 @@ async fn defect_3_queued_frames_survive_link_close() {
     drop(rx);
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+// ————————————————————————————————————————————— P4 的缺陷回归（#12 / #13）
+
+/// 缺陷 #13（后半）：v1 的 SOCKS5 端口完全不做认证（`agent/handler/socks.go`
+/// 的 `checkMethod` 只挑方法、不校验凭据），任何能连到该端口的客户端都能把
+/// 它当开放代理用。v2 一旦配置凭据，就**强制**走 RFC 1929：
+/// 客户端即使同时声明「无认证」，也不能被选上。
+#[tokio::test]
+async fn defect_13_socks_with_credentials_never_falls_back_to_no_auth() {
+    use stowaway_core::{Credentials, SocksServerConfig, negotiate};
+    use tokio::io::AsyncWriteExt;
+
+    let cfg = SocksServerConfig {
+        credentials: Some(Credentials::new("alice", "s3cret")),
+    };
+    let (mut client, mut server) = tokio::io::duplex(4096);
+    let task = tokio::spawn(async move { negotiate(&mut server, &cfg).await });
+
+    // 客户端声明「支持无认证 + 用户名密码」：v1 会挑无认证放行。
+    client.write_all(&[5, 2, 0, 2]).await.expect("greeting");
+    let mut reply = [0u8; 2];
+    use tokio::io::AsyncReadExt;
+    client.read_exact(&mut reply).await.expect("reply");
+    assert_eq!(
+        reply,
+        [5, 2],
+        "配置了凭据时只能选用户名/密码（v1 会回 [5,0] 直接放行）"
+    );
+    // 补上认证与请求，让协商正常结束（证明强制的是「方法」而不是「必然失败」）。
+    client
+        .write_all(&[
+            1, 5, b'a', b'l', b'i', b'c', b'e', 6, b's', b'3', b'c', b'r', b'e', b't',
+        ])
+        .await
+        .expect("auth");
+    let mut auth = [0u8; 2];
+    client.read_exact(&mut auth).await.expect("auth reply");
+    assert_eq!(auth, [1, 0], "正确凭据必须通过");
+    client
+        .write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 80])
+        .await
+        .expect("request");
+    let negotiated = task.await.expect("join").expect("协商必须成功");
+    assert_eq!(negotiated.cmd, 1);
+    assert_eq!(negotiated.port, 80);
+
+    // 只声明「无认证」：必须明确拒绝，而不是静默降级。
+    let cfg = SocksServerConfig {
+        credentials: Some(Credentials::new("alice", "s3cret")),
+    };
+    let (mut client, mut server) = tokio::io::duplex(4096);
+    let task = tokio::spawn(async move { negotiate(&mut server, &cfg).await });
+    client.write_all(&[5, 1, 0]).await.expect("greeting");
+    let mut reply = [0u8; 2];
+    client.read_exact(&mut reply).await.expect("reply");
+    assert_eq!(reply, [5, 255], "没有可接受的方法时必须回 0xFF");
+    assert!(
+        task.await.expect("join").is_err(),
+        "协商必须以错误结束，不能假装成功"
+    );
+}
+
+/// 缺陷 #13（前半）：v1 用 `os.Create(file.FileName)` 直接落盘
+/// （`share/file.go:148`），客户端传 `../` 就写到 `--download-dir` 之外。
+#[test]
+fn defect_13_file_name_validation_blocks_escape() {
+    use stowaway_core::{IncomingFile, safe_join, validate_name};
+    use stowaway_protocol::FileParam;
+
+    let root = std::env::temp_dir().join("rs-away-defect13");
+    std::fs::create_dir_all(&root).expect("mkdir");
+
+    for name in [
+        "../escape.txt",
+        "../../etc/passwd",
+        "sub/dir.txt",
+        "sub\\dir.txt",
+        "..",
+        ".",
+        ".bashrc",
+        "CON",
+        "lpt1.txt",
+    ] {
+        assert!(
+            validate_name(name).is_err(),
+            "{name:?} 必须被拒绝（v1 会直接 os.Create）"
+        );
+        assert!(safe_join(&root, name).is_err(), "{name:?} 不得拼出路径");
+        let param = FileParam {
+            name: name.to_owned(),
+            size: 1,
+            sha256: [0u8; 32],
+            offset: 0,
+        };
+        assert!(
+            IncomingFile::new(SessionKey::new(NodeId::ADMIN, 1), &root, &param).is_err(),
+            "{name:?} 不得创建下载目标"
+        );
+    }
+
+    // 合法名字必须落在 root 之内（且是直接子项，不是别处）。
+    let ok = FileParam {
+        name: "ok.txt".to_owned(),
+        size: 3,
+        sha256: [0u8; 32],
+        offset: 0,
+    };
+    let f = IncomingFile::new(SessionKey::new(NodeId::ADMIN, 2), &root, &ok).expect("ok");
+    assert_eq!(f.path.parent(), Some(root.as_path()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 缺陷 #12：上游代理提前短响应（< 4 字节）会触发 v1 的
+/// `resultBuf[begin-4:begin]` 负索引 panic（`share/proxy.go:205`）。
+#[tokio::test]
+async fn defect_12_short_proxy_response_is_error_not_panic() {
+    use stowaway_core::{ProxySpec, dial_via_proxy};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.expect("accept");
+        let mut buf = [0u8; 512];
+        let _ = s.read(&mut buf).await;
+        // 只有 2 字节：v1 会切 resultBuf[-2:0]。
+        let _ = s.write_all(b"HT").await;
+        drop(s);
+    });
+
+    let spec = ProxySpec::http(addr.to_string(), "", "");
+    let err = dial_via_proxy(&spec, "example.com:443")
+        .await
+        .expect_err("短响应必须报错");
+    // 关键在于「返回 Err 而不是 panic」，文案不作强断言。
+    assert!(!err.to_string().is_empty());
+}
