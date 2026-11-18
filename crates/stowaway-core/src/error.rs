@@ -23,6 +23,10 @@ pub enum CoreError {
     #[error("I/O 错误：{0}")]
     Io(#[from] std::io::Error),
 
+    /// SOCKS5 协议错误（握手/请求/回复解析失败）。
+    #[error("SOCKS5 协议错误：{0}")]
+    Socks(#[from] crate::socks::SocksError),
+
     /// 目标节点不在本节点可见的拓扑里。
     #[error("未知节点：{node}")]
     UnknownNode {

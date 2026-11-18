@@ -13,11 +13,13 @@
 //!   session   ── SessionKey 表、序号校验、有界背压
 //!   link_actor ── 每链路单写者 + 批量 flush（plan §4.9）
 //!   node      ── 上述组件的运行时聚合
+//!   socks / socks_server ── SOCKS5 线协议与协商（RFC 1928/1929）
+//!   session_stream ── 把 SessionData 适配成 AsyncRead + AsyncWrite
+//!   forward / backward / file / udp_relay / upstream_proxy ── 具体服务
 //! ```
 //!
-//! P3 只实现拓扑/路由/会话/链路 actor；服务实现（SOCKS5、forward、文件、
-//! shell、SSH）见 P4/P5。
-// 库代码禁止直接打印（由二进制/调用方决定输出方式）。
+//! P4 已实现 SOCKS5（TCP + UDP ASSOCIATE）、forward、backward、文件传输与
+//! 上游代理拨号；shell（PTY）、SSH、SSH 隧道与 `connect` 桥接见 P5。
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 pub mod dispatch;
@@ -25,6 +27,7 @@ pub mod error;
 pub mod link_actor;
 pub mod node;
 pub mod session;
+pub mod socks;
 pub mod topology;
 
 pub use dispatch::{Route, decide, undeliverable_status};
@@ -32,4 +35,5 @@ pub use error::{CoreError, Result};
 pub use link_actor::{LINK_BATCH_BYTES, LINK_BATCH_MS, LinkActor, LinkCommand};
 pub use node::{Node, NodeConfig};
 pub use session::{SESSION_QUEUE_DEPTH, SessionMeta, SessionState, SessionTable};
+pub use socks::{Parsed, SocksError, Target, TargetAddr};
 pub use topology::{NodeMeta, RouteEntry, Topology};
