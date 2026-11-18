@@ -29,6 +29,7 @@ pub mod node;
 pub mod session;
 pub mod session_stream;
 pub mod socks;
+pub mod socks_server;
 pub mod topology;
 
 pub use dispatch::{Route, decide, undeliverable_status};
@@ -38,4 +39,8 @@ pub use node::{Node, NodeConfig};
 pub use session::{SESSION_QUEUE_DEPTH, SessionMeta, SessionState, SessionTable};
 pub use session_stream::{SessionOutbound, SessionStream, outbound_message};
 pub use socks::{Parsed, SocksError, Target, TargetAddr};
+pub use socks_server::{
+    Credentials, DIAL_TIMEOUT, Negotiated, READY_TIMEOUT, SocksServerConfig, dial_code,
+    dial_target, negotiate, pump, relay, serve_connect, wait_ready,
+};
 pub use topology::{NodeMeta, RouteEntry, Topology};
