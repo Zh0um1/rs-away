@@ -424,6 +424,7 @@ S → C  Ready       （隐含：AuthConfirm 校验通过后开始收帧）
 ```rust
 pub struct SessionKey { pub origin: NodeId, pub id: u64 }   // 复合键：修正单 u64 在多跳/桥接下的撞号
 pub enum SessionKind { Socks5, Socks5Udp, Forward, Backward, File, ShellPty, Ssh, SshTunnel }
+pub enum SessionDirection { Outbound, Inbound }   // 相对**接收方**：Outbound=接收方去拨号，Inbound=接收方提供监听
 ```
 
 | 变更 | 原因 |
@@ -509,6 +510,28 @@ pub enum SessionKind { Socks5, Socks5Udp, Forward, Backward, File, ShellPty, Ssh
 **不合入 blocking 清单的项**（纠正旧方案）：`freebsd/armv7`、`linux/armv7-gnu`、以及任何「全 target 静态 musl」的表述——Go 版 Makefile 中 **`musl` 出现 0 次**，是 glibc 动态链接。
 
 **工具链**：`xtask build-matrix`（不是 cargo-dist：它无 FreeBSD runner、tier-3 无 std、i686-musl 缺 32 位链接器）。`xtask` 驱动 `cargo build`（host 可交叉的）、`cross`（musl/arm）、FreeBSD VM；产物命名与 Go 版对齐（`release/agent_linux_x64` 等）。
+
+---
+
+### 4.14 实施偏差记录（P1–P4 累积，实现即事实）
+
+设计与落地不一致时，**以本节为准**，并且不允许悄悄改口径——每条都要写清「为什么偏离」。
+后续阶段若改变这些决定，在这里追加而不是覆盖。
+
+| # | 设计原文 | 实际实现 | 为什么 |
+|---|---|---|---|
+| E1 | §4.5 `transcript_hash` 由 client 先发 | 两侧各自**本地**算 TH，`Hello/AuthConfirm` 都不携带 TH | 先发 TH 会形成循环定义（算 TH 需要对方 eph/nonce） |
+| E2 | §4.5 「每 2²⁸ 帧 rekey 并通过专用 `Rekey` 控制帧通告」 | 无 `Rekey` 消息；按 `counter / REKEY_INTERVAL` **隐式换代**，双方各自推导 | 18 种消息里没有 Rekey；隐式换代不需要额外往返，也不会出现「通告帧本身被旧键加密」的鸡生蛋问题 |
+| E3 | §4.4 flags bit1 `COMPRESSED` 预留 | `LinkCodec::recv` 收到压缩位**显式报错断链** | 压缩是缺陷 #8 的放大器（`crypto/gzip.go:23` 解压失败返回空切片）；既然不实现，就不该容忍该位 |
+| E4 | §4.4 帧头是 AEAD 的 AAD | 一致；但 **counter 放在密文前缀**（8 字节 LE）而非帧头 | 帧头是 AAD，接收端必须在验帧**之前**信任它；counter 放进密文由 `LinkSealer::open` 内部先验 AEAD 再推进窗口（防伪造帧推进窗口） |
+| E5 | §4.9 LinkActor「批量 flush 64 KiB **或 4 ms**」 | 只按**字节阈值**与「队列排空」攒批，**不主动等 4 ms** | 单 actor 同时负责入站读取，主动 sleep 会一起停住入站；尾延迟损失大于合并收益。`LINK_BATCH_MS` 保留为口径常量 |
+| E6 | §4.8 `OpenSession` 起会话 | 新增 `Join{node}` 的**代子公告**语义 | v2 帧没有 sender 字段，`from` 只是链路对端；子节点接入必须由父节点立即上传，否则 admin 在孙节点首个心跳到达前不知道它存在 |
+| E7 | §4.8 `Handled::SessionOpened` | 携带完整 `OpenSession`（不是只有 `key`） | 响应方需要 `kind`/`direction`/`target` 才能决定「拨号还是监听」 |
+| E8 | §4.8 backward 会话键 | `BackwardListener::accept` **每条连接**分配独立 `SessionKey`（`key.id.wrapping_add(n)`） | 反向映射一次只承载一条连接；共用 key 会让对端会话表互相覆盖 |
+| E9 | §5.2「修 #12」未指定模块 | 新增 `stowaway_core::upstream_proxy`（SOCKS5/HTTP 上游代理拨号 + `Proxy-Authorization`） | #12 的两个 bug（`share/proxy.go:205` 负索引、CONNECT 无认证头）都在「作为客户端连上游代理」这条路径上，独立模块便于单测 |
+| E10 | §4.5 secret 长度下限 8 | 一致；README 的 `-s 123` 需 `--allow-weak-secret` | 保持兼容但显式告警 |
+| E11 | §4.11 magic 由 secret 派生 | 改为 `--reuse-magic` **安装期随机 16 字符**（缺省才回落派生） | 派生值是 secret 的函数，泄露 magic 等于给离线爆破一个已知明文 |
+| E12 | §4.10 admin 侧 `-csrf`/`-heartbeat` 等 CLI | 见 §6 映射表；`-heartbeat` 语义改为双向 + RTT | v1 的心跳是单向且 agent 侧 `case HEARTBEAT` 为空分支 |
 
 ---
 
@@ -841,10 +864,10 @@ P0 起每 push 跑：`fmt --check` / `clippy --workspace --all-targets --all-fea
 | 24 | `FILEERR` | `ServiceExit{err}` | 错误改由统一的 exit reason 表达 |
 | 25 | `FILEDOWNREQ` | `ServiceRequest{kind: FileDownload}` | |
 | 26 | `FILEDOWNRES` | `ServiceReply` | |
-| 27 | `SOCKSSTART` | `OpenSession{kind: Socks5, direction: Down}` | admin 发起 → agent 拨号 |
+| 27 | `SOCKSSTART` | `OpenSession{kind: Socks5, direction: Outbound}` | admin 发起 → agent 拨号 |
 | 28 | `SOCKSTCPDATA` | `SessionData` | 带 `seq` |
 | 29 | `SOCKSUDPDATA` | `SessionData`（`kind: Socks5Udp`） | 数据报边界由会话层编码 |
-| 30 | `UDPASSSTART` | `OpenSession{kind: Socks5Udp, direction: Up}` | **agent 发起**（F2） |
+| 30 | `UDPASSSTART` | `OpenSession{kind: Socks5Udp, direction: Inbound}` | **agent 发起**（F2） |
 | 31 | `UDPASSRES` | `SessionReady` | 携带绑定地址 |
 | 32 | `SOCKSTCPFIN` | `SessionClose{reason: Eof}` | 半关闭用 `flags.LAST` 表示，不用此消息 |
 | 33 | `SOCKSREADY` | `SessionReady{code: Ok}` | v1 无错误码 |
@@ -854,7 +877,7 @@ P0 起每 push 跑：`fmt --check` / `clippy --workspace --all-targets --all-fea
 | 37 | `FORWARDDATA` | `SessionData` | |
 | 38 | `FORWARDFIN` | `SessionClose` | |
 | 39 | `BACKWARDTEST` | `ServiceRequest{kind: Backward, phase: Probe}` | |
-| 40 | `BACKWARDSTART` | `OpenSession{kind: Backward, direction: Up}` | 反向发起，`origin` 区分 |
+| 40 | `BACKWARDSTART` | `OpenSession{kind: Backward, direction: Inbound}` | 反向发起，`origin` 区分 |
 | 41 | `BACKWARDSEQ` | `OpenSession`（`id` 协商字段） | 由 `SessionKey{origin,id}` 消歧，不再二次协商 |
 | 42 | `BACKWARDREADY` | `SessionReady` | |
 | 43 | `BACKWARDDATA` | `SessionData` | |
