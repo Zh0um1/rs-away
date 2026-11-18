@@ -27,6 +27,7 @@ pub mod error;
 pub mod link_actor;
 pub mod node;
 pub mod session;
+pub mod session_stream;
 pub mod socks;
 pub mod topology;
 
@@ -35,5 +36,6 @@ pub use error::{CoreError, Result};
 pub use link_actor::{LINK_BATCH_BYTES, LINK_BATCH_MS, LinkActor, LinkCommand};
 pub use node::{Node, NodeConfig};
 pub use session::{SESSION_QUEUE_DEPTH, SessionMeta, SessionState, SessionTable};
+pub use session_stream::{SessionOutbound, SessionStream, outbound_message};
 pub use socks::{Parsed, SocksError, Target, TargetAddr};
 pub use topology::{NodeMeta, RouteEntry, Topology};

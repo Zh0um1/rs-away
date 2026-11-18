@@ -10,7 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use stowaway_protocol::{
     CloseReason, Heartbeat, Message, MsgType, NodeId, NodeKind, NodeScope, NodeState, NodeStatus,
-    SessionCode, SessionKey, SessionKind,
+    OpenSession, SessionCode, SessionData, SessionKey, SessionKind,
 };
 
 use crate::dispatch::{Route, decide, undeliverable_status};
@@ -56,6 +56,15 @@ pub struct LinkEntry {
     pub sealed: bool,
 }
 
+/// 一条已绑定的会话流。
+#[derive(Debug)]
+struct SessionBinding {
+    /// 会话另一端。
+    peer: NodeId,
+    /// 入站数据投递端（由 [`crate::session_stream::SessionStream::new`] 产出）。
+    sink: tokio::sync::mpsc::Sender<SessionData>,
+}
+
 /// 节点运行时。
 #[derive(Debug)]
 pub struct Node {
@@ -63,6 +72,12 @@ pub struct Node {
     topology: Topology,
     sessions: SessionTable,
     links: HashMap<NodeId, LinkEntry>,
+    /// 已绑定会话流：会话键 → (对端节点, 入站数据投递端)。
+    ///
+    /// 只有「本节点是会话某一端」时才登记；纯转发（中间节点）永不登记，
+    /// 因此中间节点不会解 session 层（plan §4.7）。对端节点必须显式记录：
+    /// 会话另一端的编号无法从帧里推出（v2 帧没有 sender 字段）。
+    session_sinks: HashMap<SessionKey, SessionBinding>,
     /// 已发起的会话 id 计数器（`SessionKey.origin` 恒为本节点）。
     next_session_id: u64,
     /// 未送达计数（诊断）。
@@ -79,6 +94,7 @@ impl Node {
             topology,
             sessions: SessionTable::new(),
             links: HashMap::new(),
+            session_sinks: HashMap::new(),
             next_session_id: 0,
             undeliverable: 0,
         }
@@ -259,6 +275,7 @@ impl Node {
             .collect();
         for key in orphans {
             let _ = self.sessions.close(&key, CloseReason::Reset);
+            self.session_sinks.remove(&key);
         }
         self.topology.invalidate();
         removed
@@ -268,6 +285,69 @@ impl Node {
     #[must_use]
     pub fn link(&self, peer: NodeId) -> Option<&LinkEntry> {
         self.links.get(&peer)
+    }
+
+    /// 把一个会话流绑定到本节点：之后属于该会话的 `SessionData` 会投给它。
+    ///
+    /// `out` 是流向外发帧的通道，`sink` 是流读取数据的入口 —— 两者由
+    /// [`SessionStream::new`] 一起产出，这里只登记不创建。
+    ///
+    /// 同一个会话键只允许绑定一次（重复绑定说明业务层重复受理同一会话）。
+    ///
+    /// # Errors
+    /// 会话键已被绑定。
+    pub fn bind_session(
+        &mut self,
+        key: SessionKey,
+        peer: NodeId,
+        sink: tokio::sync::mpsc::Sender<SessionData>,
+    ) -> Result<()> {
+        if self.session_sinks.contains_key(&key) {
+            return Err(CoreError::SessionExists { key });
+        }
+        self.session_sinks
+            .insert(key, SessionBinding { peer, sink });
+        Ok(())
+    }
+
+    /// 解除会话绑定（会话结束时调用，避免 sink 泄漏）。
+    pub fn unbind_session(&mut self, key: SessionKey) {
+        self.session_sinks.remove(&key);
+    }
+
+    /// 当前绑定的会话数（诊断/测试用）。
+    #[must_use]
+    pub fn bound_sessions(&self) -> usize {
+        self.session_sinks.len()
+    }
+
+    /// 发一条 `SessionData` 到目标节点（由会话流发起）。
+    ///
+    /// # Errors
+    /// 不可达或链路关闭。
+    pub async fn send_session_data(&mut self, data: SessionData) -> Result<()> {
+        let dest = self.session_dest(data.key)?;
+        self.send(&Message::SessionData(data), dest).await
+    }
+
+    /// 发一条 `SessionClose` 到目标节点。
+    ///
+    /// # Errors
+    /// 不可达或链路关闭。
+    pub async fn send_session_close(
+        &mut self,
+        close: stowaway_protocol::SessionClose,
+    ) -> Result<()> {
+        let dest = self.session_dest(close.key)?;
+        self.send(&Message::SessionClose(close), dest).await
+    }
+
+    /// 会话的对端节点（绑定时登记的那个）。
+    fn session_dest(&self, key: SessionKey) -> Result<NodeId> {
+        self.session_sinks
+            .get(&key)
+            .map(|b| b.peer)
+            .ok_or(CoreError::UnknownSession { key })
     }
 
     /// 全部链路对端。
@@ -405,7 +485,7 @@ impl Node {
                 if self.sessions.get(&open.key).is_none() {
                     self.sessions.open(open.key, open.kind)?;
                 }
-                Ok(Handled::SessionOpened { key: open.key })
+                Ok(Handled::SessionOpened(open))
             }
             Message::SessionReady(ready) => {
                 self.sessions.ready(&ready.key, ready.code)?;
@@ -415,15 +495,27 @@ impl Node {
                 })
             }
             Message::SessionData(data) => {
+                let seq = data.seq;
+                let len = data.data.len();
+                let key = data.key;
+                // 先过会话表的序号校验（乱序/重放/未就绪一律报错），
+                // 再把数据交给绑定在会话上的流。
                 self.sessions.accept_data(&data)?;
-                Ok(Handled::SessionData {
-                    key: data.key,
-                    seq: data.seq,
-                    len: data.data.len(),
-                })
+                if let Some(binding) = self.session_sinks.get(&key) {
+                    binding.sink.try_send(data).map_err(|e| match e {
+                        // 消费端满了：不丢帧，而是把背压往链路方向传导。
+                        tokio::sync::mpsc::error::TrySendError::Full(_) => CoreError::Backpressure,
+                        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                            CoreError::UnknownSession { key }
+                        }
+                    })?;
+                }
+                Ok(Handled::SessionData { key, seq, len })
             }
             Message::SessionClose(close) => {
                 let _ = self.sessions.close(&close.key, close.reason);
+                // 会话结束：解绑并关掉投递端，让会话流读到 EOF。
+                self.session_sinks.remove(&close.key);
                 Ok(Handled::SessionClosed { key: close.key })
             }
             Message::JoinAck(ack) => {
@@ -522,11 +614,8 @@ pub enum Handled {
     Topology,
     /// 节点状态上报。
     Status(NodeStatus),
-    /// 会话打开。
-    SessionOpened {
-        /// 键。
-        key: SessionKey,
-    },
+    /// 会话打开（携带完整请求：响应方要按 `kind`/`direction` 决定拨号还是监听）。
+    SessionOpened(OpenSession),
     /// 会话确认。
     SessionReady {
         /// 键。
