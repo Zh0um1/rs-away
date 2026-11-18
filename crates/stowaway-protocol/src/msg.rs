@@ -196,6 +196,14 @@ pub struct Join {
     pub listen: Option<String>,
     /// 申请方支持的 feature 位（用于后续能力协商）。
     pub capabilities: u32,
+    /// 被公告的节点。
+    ///
+    /// 二义性由发送方决定（见 plan §4.6 与附录 A 第 3、4 行）：
+    /// - `NodeId::UNASSIGNED`：发送方自己入网，请接收方分配 `NodeId`；
+    /// - 具体 `NodeId`：发送方**代替**它向上游公告「这个节点的父节点是我」，
+    ///   用于新子节点接入后让 admin 立刻补齐拓扑（否则 admin 要等下次
+    ///   心跳才能发现孙节点，转发会短暂不可达）。
+    pub node: NodeId,
 }
 
 /// 加入许可。
@@ -707,6 +715,7 @@ mod tests {
                 kind: NodeKind::Agent,
                 listen: Some("0.0.0.0:8080".into()),
                 capabilities: 0b1011,
+                node: NodeId::UNASSIGNED,
             }),
             Message::JoinAck(JoinAck {
                 node: NodeId::new([1u8; 16]),

@@ -73,6 +73,7 @@ fn seeds() -> Vec<Vec<u8>> {
             kind: stowaway_protocol::node::NodeKind::Agent,
             listen: Some("127.0.0.1:8080".into()),
             capabilities: 0xff,
+            node: stowaway_protocol::node::NodeId::UNASSIGNED,
         }),
         Message::JoinAck(stowaway_protocol::msg::JoinAck {
             node: stowaway_protocol::node::NodeId::new([7u8; 16]),
