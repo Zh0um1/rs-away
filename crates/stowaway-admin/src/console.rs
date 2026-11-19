@@ -588,6 +588,16 @@ impl Console {
             param: ServiceParam::Shell(param),
         };
         let mut notes = self.drain_events();
+        // 先在本端登记，再发 `OpenSession`：对端的 `SessionReady` 要靠会话表
+        // 落账（plan §4.14 E18）。
+        if let Err(e) = self
+            .handle
+            .register_session(key, SessionKind::ShellPty)
+            .await
+        {
+            notes.push(format!("错误：shell 会话无法登记：{e}"));
+            return Outcome::lines(notes);
+        }
         if let Err(e) = self.handle.send(Message::OpenSession(open), target).await {
             notes.push(format!("错误：shell 未开启：{e}"));
             return Outcome::lines(notes);
@@ -1111,6 +1121,16 @@ async fn run_socks(
                 let _ = client.flush().await;
                 return;
             }
+            // 发起方也要登记会话：对端回的 `SessionReady` 要靠会话表落账，
+            // 而 `await_ready` 也是靠它区分「还没就绪」与「没这条会话」
+            // （plan §4.14 E18；缺这一步会在等就绪时立刻被判未知会话）。
+            if handle
+                .register_session(key, SessionKind::Socks5)
+                .await
+                .is_err()
+            {
+                return;
+            }
             let mut session = match handle.open_stream(key, peer).await {
                 Ok(s) => s,
                 Err(_) => return,
@@ -1178,6 +1198,14 @@ async fn run_forward(
         let handle = handle.clone();
         let run = run.clone();
         tokio::spawn(async move {
+            // forward 的发起方同样要先登记会话（同上一条注释）。
+            if handle
+                .register_session(key, SessionKind::Forward)
+                .await
+                .is_err()
+            {
+                return;
+            }
             let mut session = match handle.open_stream(key, peer).await {
                 Ok(s) => s,
                 Err(_) => return,

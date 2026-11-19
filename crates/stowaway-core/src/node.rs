@@ -199,6 +199,20 @@ impl Node {
         Ok(key)
     }
 
+    /// 登记一条**由本端发起**的会话（键由调用方给）。
+    ///
+    /// 发起方也必须登记：对端回的 `SessionReady` 要写进会话表
+    /// （[`SessionTable::ready`] 对未知键报 `UnknownSession`），而
+    /// [`Node::session_dest`] 也靠 `session_sinks` 找目标。少了这一步，
+    /// 「等就绪」会立刻失败，数据也只能单向流。
+    ///
+    /// # Errors
+    /// 会话键已被登记。
+    pub fn register_session(&mut self, key: SessionKey, kind: SessionKind) -> Result<()> {
+        self.sessions.open(key, kind)?;
+        Ok(())
+    }
+
     /// 登记一条链路；同时把对端写进拓扑。
     ///
     /// # Errors

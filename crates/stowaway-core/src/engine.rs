@@ -142,6 +142,19 @@ pub enum Command {
         /// 回执（返回被级联摘除的节点）。
         reply: oneshot::Sender<Vec<NodeId>>,
     },
+    /// 登记一条由本端发起的会话（必须在发 `OpenSession` 之前）。
+    ///
+    /// 发起方也要登记：对端回的 `SessionReady` 要写进会话表，否则
+    /// `sessions.ready` 报 `UnknownSession`；`await_ready` 也是靠会话表
+    /// 判断「这条会话到底存不存在」，未登记就会被立刻判死。
+    RegisterSession {
+        /// 会话键。
+        key: SessionKey,
+        /// 会话种类。
+        kind: stowaway_protocol::SessionKind,
+        /// 回执。
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// 打开一条会话流（引擎创建并绑定，返回可读写的流）。
     OpenStream {
         /// 会话键。
@@ -363,6 +376,31 @@ impl EngineHandle {
             .await
             .map_err(|_| closed())?;
         rx.await.map_err(|_| closed())
+    }
+
+    /// 登记一条由本端发起的会话。
+    ///
+    /// 发起方必须登记：对端回的 `SessionReady` 要靠会话表落账，
+    /// [`EngineHandle::await_ready`] 也靠它区分「还没就绪」与「根本没这条
+    /// 会话」。
+    ///
+    /// # Errors
+    /// 引擎已停止，或会话键已被登记。
+    pub async fn register_session(
+        &self,
+        key: SessionKey,
+        kind: stowaway_protocol::SessionKind,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(Command::RegisterSession {
+                key,
+                kind,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| closed())?;
+        rx.await.map_err(|_| closed())?
     }
 
     /// 打开一条会话流。
@@ -726,6 +764,11 @@ impl Engine {
                     self.drop_actor(*gone);
                 }
                 let _ = reply.send(removed);
+                Ok(())
+            }
+            Command::RegisterSession { key, kind, reply } => {
+                let res = self.node.register_session(key, kind);
+                let _ = reply.send(res);
                 Ok(())
             }
             Command::OpenStream { key, dest, reply } => {
@@ -1268,6 +1311,48 @@ mod tests {
             "应报未知会话，实际 {res:?}"
         );
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn register_session_makes_await_ready_work_for_the_initiator() {
+        // 发起方（admin 的 socks/forward/shell）自己发 `OpenSession`：若不先登记，
+        // 对端回的 `SessionReady` 无处落账，`await_ready` 也会立刻判未知会话。
+        let child = NodeId::new([0x25; 16]);
+        let key = stowaway_protocol::SessionKey::new(NodeId::ADMIN, 1);
+        let (mut _erx, handle, engine, inbound_tx) = engine_with_events();
+        let task = tokio::spawn(engine.run());
+
+        handle
+            .register_session(key, stowaway_protocol::SessionKind::Socks5)
+            .await
+            .expect("register");
+
+        let probe = handle.clone();
+        let waiter = tokio::spawn(async move { probe.await_ready(key).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "登记了就绪后仍在等对端答复");
+
+        // 对端（agent）确认出口建起来了。
+        inbound_tx
+            .send(inbound(
+                child,
+                stowaway_protocol::Message::SessionReady(stowaway_protocol::SessionReady {
+                    key,
+                    code: stowaway_protocol::SessionCode::Ok,
+                    detail: "已连上 127.0.0.1:22".to_owned(),
+                }),
+            ))
+            .await
+            .expect("ready");
+
+        let code = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("必须被唤醒")
+            .expect("join")
+            .expect("await_ready");
+        assert_eq!(code, stowaway_protocol::SessionCode::Ok);
+        handle.shutdown().await.expect("shutdown");
+        task.await.expect("join").expect("engine ok");
     }
 
     #[tokio::test]
