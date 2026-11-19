@@ -683,7 +683,12 @@ impl Console {
             return Outcome::lines(notes);
         }
         notes.push(done);
-        let key = key.expect("服务请求一定带 key");
+        // 调用方只把 `Service*` 消息交给本函数；拿不到 key 说明传错了消息种类，
+        // 与其 panic 不如把它当成一次失败的命令（缺陷 #2：v1 在这里直接 panic）。
+        let Some(key) = key else {
+            notes.push("错误：内部消息种类不对（缺少会话键）".to_owned());
+            return Outcome::lines(notes);
+        };
         let (ev, more) = self
             .wait_event("服务应答", REPLY_TIMEOUT, |ev| {
                 matches!(
