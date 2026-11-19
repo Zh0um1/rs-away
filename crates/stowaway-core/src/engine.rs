@@ -20,7 +20,7 @@
 //! 与其加锁，不如让单个任务持有它 —— 这正是 actor 模型的本意，也避免了
 //! 锁顺序问题。代价是「读快照」也要走通道，见 [`Command::Snapshot`]。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -173,6 +173,21 @@ pub enum Command {
     Snapshot {
         /// 回执。
         reply: oneshot::Sender<Snapshot>,
+    },
+    /// 定向等待某条会话的 `SessionReady`。
+    ///
+    /// 与「订阅 [`Event::SessionReady`]」的区别：广播事件只有一个接收端
+    /// （控制台的 [Event] 流），而后台监听任务（`socks` / `forward`）需要
+    /// 各自等**自己那一条**会话就绪。把事件流拆给多个消费者会让「谁漏了
+    /// 哪条事件」变成竞态，所以改成登记一次性等待者，由引擎在
+    /// `SessionReady` 到达时定向兑现。
+    ///
+    /// 已经就绪（或已登记过结果）时立即返回，不会漏。
+    AwaitReady {
+        /// 会话键。
+        key: SessionKey,
+        /// 回执：就绪码，或会话根本不存在。
+        reply: oneshot::Sender<Result<stowaway_protocol::SessionCode>>,
     },
     /// 立刻发一轮心跳（诊断/测试用；定时心跳由 [`Engine::with_heartbeat`] 起）。
     Pulse,
@@ -367,6 +382,23 @@ impl EngineHandle {
         rx.await.map_err(|_| closed())?
     }
 
+    /// 定向等待某条会话的 `SessionReady`。
+    ///
+    /// 与订阅 [`Event::SessionReady`] 不同，这里允许多个任务各等各的会话，
+    /// 事件不会因为「接收端只有一个」而漏掉（见 [`Command::AwaitReady`]）。
+    ///
+    /// # Errors
+    /// 引擎已停止、会话根本不存在（[`CoreError::UnknownSession`]），
+    /// 或该会话已经有别的等待者（[`CoreError::Backpressure`]）。
+    pub async fn await_ready(&self, key: SessionKey) -> Result<stowaway_protocol::SessionCode> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(Command::AwaitReady { key, reply: tx })
+            .await
+            .map_err(|_| closed())?;
+        rx.await.map_err(|_| closed())?
+    }
+
     /// 回报会话就绪。
     ///
     /// # Errors
@@ -463,6 +495,10 @@ pub struct Engine {
     actors: Vec<(NodeId, JoinHandle<()>)>,
     rtt: BTreeMap<NodeId, PeerRtt>,
     heartbeat: Option<HeartbeatConfig>,
+    /// 已到达的 `SessionReady` 结果（供迟到的 [`Command::AwaitReady`] 立即兑现）。
+    ready_codes: HashMap<SessionKey, stowaway_protocol::SessionCode>,
+    /// 正在等 `SessionReady` 的一次性等待者。
+    ready_waiters: HashMap<SessionKey, oneshot::Sender<Result<stowaway_protocol::SessionCode>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -503,6 +539,8 @@ impl Engine {
             actors: Vec::new(),
             rtt: BTreeMap::new(),
             heartbeat: None,
+            ready_codes: HashMap::new(),
+            ready_waiters: HashMap::new(),
         };
         let handle = engine.handle.clone();
         let inbound = engine.inbound_tx.clone();
@@ -606,9 +644,11 @@ impl Engine {
                 let _ = self.events.send(Event::SessionOpened { open, from });
             }
             Handled::SessionReady { key, code } => {
+                self.deliver_ready(key, code);
                 let _ = self.events.send(Event::SessionReady { key, code });
             }
             Handled::SessionClosed { key } => {
+                self.forget_ready(key);
                 self.node.unbind_session(key);
                 let _ = self.events.send(Event::SessionClosed { key });
             }
@@ -713,6 +753,25 @@ impl Engine {
                 self.node.unbind_session(key);
                 Ok(())
             }
+            Command::AwaitReady { key, reply } => {
+                // 已经就绪过（结果留在表里）→ 立即兑现，避免「等的人晚到」丢事件。
+                if let Some(code) = self.ready_codes.get(&key).copied() {
+                    let _ = reply.send(Ok(code));
+                    return Ok(());
+                }
+                // 会话不存在：现在就知道不会有人来兑现，直接报错而不是让它等到超时。
+                if self.node.sessions().get(&key).is_none() {
+                    let _ = reply.send(Err(CoreError::UnknownSession { key }));
+                    return Ok(());
+                }
+                // 同一会话只允许一个等待者：后来者覆盖前者会让前者饿死，因此拒绝。
+                if self.ready_waiters.contains_key(&key) {
+                    let _ = reply.send(Err(CoreError::Backpressure));
+                    return Ok(());
+                }
+                self.ready_waiters.insert(key, reply);
+                Ok(())
+            }
             Command::Snapshot { reply } => {
                 let _ = reply.send(self.snapshot());
                 Ok(())
@@ -764,6 +823,22 @@ impl Engine {
             parent,
         });
         Ok(())
+    }
+
+    /// 兑现某个会话的 `SessionReady`：有等待者就直接给，否则记下结果。
+    fn deliver_ready(&mut self, key: SessionKey, code: stowaway_protocol::SessionCode) {
+        if let Some(waiter) = self.ready_waiters.remove(&key) {
+            let _ = waiter.send(Ok(code));
+        }
+        self.ready_codes.insert(key, code);
+    }
+
+    /// 会话终结时清掉等待表与结果表，避免长跑进程无限增长。
+    fn forget_ready(&mut self, key: SessionKey) {
+        self.ready_codes.remove(&key);
+        if let Some(waiter) = self.ready_waiters.remove(&key) {
+            let _ = waiter.send(Err(CoreError::UnknownSession { key }));
+        }
     }
 
     fn drop_actor(&mut self, peer: NodeId) {
@@ -919,6 +994,7 @@ pub type SharedHandle = Arc<EngineHandle>;
 mod tests {
     use super::{Command, Engine, EngineHandle, Event, Snapshot, now_ms};
     use crate::node::NodeConfig;
+    use std::time::Duration;
     use stowaway_protocol::{Message, NodeId, NodeKind};
     use tokio::sync::mpsc;
 
@@ -929,6 +1005,19 @@ mod tests {
     ) {
         let (tx, _rx) = mpsc::unbounded_channel::<Event>();
         Engine::new(NodeConfig::new(NodeId::ADMIN, NodeKind::Admin), tx)
+    }
+
+    /// 保留事件接收端 + 入站投递端，便于驱动「入站帧 → 就绪」的完整路径。
+    fn engine_with_events() -> (
+        mpsc::UnboundedReceiver<Event>,
+        EngineHandle,
+        Engine,
+        mpsc::Sender<crate::link_actor::InboundFrame>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel::<Event>();
+        let (handle, engine, inbound) =
+            Engine::new(NodeConfig::new(NodeId::ADMIN, NodeKind::Admin), tx);
+        (rx, handle, engine, inbound)
     }
 
     #[tokio::test]
@@ -1005,6 +1094,180 @@ mod tests {
         assert!(s.me.is_none());
         assert!(s.nodes.is_empty());
         assert!(s.links.is_empty());
+    }
+
+    /// 把一条本地消息压成入站帧（`dest` 是自己、`via` 空 → `Route::Local`）。
+    fn inbound(from: NodeId, msg: stowaway_protocol::Message) -> crate::link_actor::InboundFrame {
+        let payload = msg.encode().expect("encode");
+        let frame = stowaway_protocol::Frame::new(
+            stowaway_protocol::FrameFlags::empty(),
+            msg.msg_type(),
+            NodeId::ADMIN,
+            Vec::new(),
+            payload,
+        );
+        crate::link_actor::InboundFrame { from, frame }
+    }
+
+    /// 登记一条「对端发起」的会话，供就绪等待用。
+    fn open_session_msg(key: stowaway_protocol::SessionKey) -> stowaway_protocol::Message {
+        stowaway_protocol::Message::OpenSession(stowaway_protocol::OpenSession {
+            key,
+            kind: stowaway_protocol::SessionKind::Socks5,
+            direction: stowaway_protocol::SessionDirection::Inbound,
+            target: Some("127.0.0.1:9".to_owned()),
+            param: stowaway_protocol::ServiceParam::None,
+        })
+    }
+
+    #[tokio::test]
+    async fn await_ready_returns_the_code_once_session_ready_arrives() {
+        let child = NodeId::new([0x21; 16]);
+        let key = stowaway_protocol::SessionKey::new(child, 1);
+        let (mut erx, handle, engine, inbound_tx) = engine_with_events();
+        let task = tokio::spawn(engine.run());
+
+        inbound_tx
+            .send(inbound(child, open_session_msg(key)))
+            .await
+            .expect("open");
+        // 等登记完成：`await_ready` 自己就会等到有结果，但我们要先确认会话在表里。
+        let probe = handle.clone();
+        let waiter = tokio::spawn(async move { probe.await_ready(key).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "还没回 Ready，等待者不该提前返回");
+
+        inbound_tx
+            .send(inbound(
+                child,
+                stowaway_protocol::Message::SessionReady(stowaway_protocol::SessionReady {
+                    key,
+                    code: stowaway_protocol::SessionCode::Ok,
+                    detail: "outlet up".to_owned(),
+                }),
+            ))
+            .await
+            .expect("ready");
+        let code = waiter
+            .await
+            .expect("join")
+            .expect("await_ready 必须拿到结果");
+        assert_eq!(code, stowaway_protocol::SessionCode::Ok);
+
+        // 事件流里那条 `SessionReady` 仍然照常广播给控制台。
+        let mut saw = false;
+        while let Ok(ev) = erx.try_recv() {
+            if matches!(ev, Event::SessionReady { key: k, code } if k == key && code == stowaway_protocol::SessionCode::Ok)
+            {
+                saw = true;
+            }
+        }
+        assert!(saw, "定向等待不能吞掉广播事件");
+        handle.shutdown().await.expect("shutdown");
+        task.await.expect("join").expect("engine ok");
+    }
+
+    #[tokio::test]
+    async fn await_ready_on_a_late_wait_is_immediate_not_lost() {
+        let child = NodeId::new([0x22; 16]);
+        let key = stowaway_protocol::SessionKey::new(child, 1);
+        let (mut erx, handle, engine, inbound_tx) = engine_with_events();
+        let task = tokio::spawn(engine.run());
+
+        inbound_tx
+            .send(inbound(child, open_session_msg(key)))
+            .await
+            .expect("open");
+        inbound_tx
+            .send(inbound(
+                child,
+                stowaway_protocol::Message::SessionReady(stowaway_protocol::SessionReady {
+                    key,
+                    code: stowaway_protocol::SessionCode::Refused,
+                    detail: "no route".to_owned(),
+                }),
+            ))
+            .await
+            .expect("ready");
+        // 先让引擎把上面两条帧处理完（消费掉广播事件作为同步点）。
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(ev) = erx.try_recv() {
+                    if matches!(ev, Event::SessionReady { .. }) {
+                        break;
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        })
+        .await
+        .expect("ready event");
+
+        // 结果已经到过了，迟到者必须立刻拿到，而不是等下一次 Ready（可能永远不来）。
+        let code = tokio::time::timeout(Duration::from_secs(1), handle.await_ready(key))
+            .await
+            .expect("迟到等待不能超时")
+            .expect("await_ready");
+        assert_eq!(code, stowaway_protocol::SessionCode::Refused);
+        handle.shutdown().await.expect("shutdown");
+        task.await.expect("join").expect("engine ok");
+    }
+
+    #[tokio::test]
+    async fn await_ready_fails_fast_for_unknown_session() {
+        let (handle, engine, _inbound) = engine();
+        let task = tokio::spawn(engine.run());
+        // 引擎里根本没有这条会话：现在就断言不会有人兑现，而不是等到调用方超时。
+        let key = stowaway_protocol::SessionKey::new(NodeId::new([0x23; 16]), 9);
+        let res = tokio::time::timeout(Duration::from_secs(1), handle.await_ready(key))
+            .await
+            .expect("必须立刻失败");
+        assert!(
+            matches!(res, Err(crate::error::CoreError::UnknownSession { .. })),
+            "应报未知会话，实际 {res:?}"
+        );
+        handle.shutdown().await.expect("shutdown");
+        task.await.expect("join").expect("engine ok");
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_wakes_the_waiter_with_an_error() {
+        let child = NodeId::new([0x24; 16]);
+        let key = stowaway_protocol::SessionKey::new(child, 1);
+        let (mut _erx, handle, engine, inbound_tx) = engine_with_events();
+        let task = tokio::spawn(engine.run());
+
+        inbound_tx
+            .send(inbound(child, open_session_msg(key)))
+            .await
+            .expect("open");
+        let probe = handle.clone();
+        let waiter = tokio::spawn(async move { probe.await_ready(key).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "先确保真的挂上了");
+
+        // 会话在 Ready 之前就关了：等待者必须被唤醒并收到错误，不能饿死。
+        inbound_tx
+            .send(inbound(
+                child,
+                stowaway_protocol::Message::SessionClose(stowaway_protocol::SessionClose {
+                    key,
+                    reason: stowaway_protocol::CloseReason::Reset,
+                    detail: String::new(),
+                }),
+            ))
+            .await
+            .expect("close");
+        let res = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("等待者必须被唤醒")
+            .expect("join");
+        assert!(
+            matches!(res, Err(crate::error::CoreError::UnknownSession { .. })),
+            "应报未知会话，实际 {res:?}"
+        );
+        task.abort();
     }
 
     #[tokio::test]
