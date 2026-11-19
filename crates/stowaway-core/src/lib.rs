@@ -34,6 +34,7 @@ pub mod file;
 pub mod forward;
 pub mod link_actor;
 pub mod node;
+pub mod service;
 pub mod session;
 pub mod session_stream;
 pub mod shell;

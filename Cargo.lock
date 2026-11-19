@@ -2812,6 +2812,7 @@ dependencies = [
  "futures-util",
  "portable-pty",
  "russh",
+ "sha2",
  "stowaway-crypto",
  "stowaway-protocol",
  "stowaway-transport",

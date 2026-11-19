@@ -453,6 +453,17 @@ impl SshConnection {
         self.handle.is_closed()
     }
 
+    /// 主动断开（服务结束时调用，避免对端留着半开连接）。
+    ///
+    /// # Errors
+    /// 连接已断。
+    pub async fn disconnect(&self, reason: &str) -> std::result::Result<(), SshError> {
+        self.handle
+            .disconnect(russh::Disconnect::ByApplication, reason, "en")
+            .await
+            .map_err(SshError::from)
+    }
+
     /// 打开一个 `direct-tcpip` 通道（SSH 隧道用）。
     ///
     /// # Errors
