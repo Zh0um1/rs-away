@@ -1065,6 +1065,21 @@ fn stop_listener(
     Outcome::lines(lines)
 }
 
+/// 把会话码翻成 SOCKS5 回包码。
+///
+/// `SessionCode` 只有 Ok/Refused/Timeout/NotFound/Denied 五种，SOCKS5 的
+/// 回包码更细（网络不可达/主机不可达分开）；这里只做保守映射：能让客户端
+/// 区分「被拒」与「超时」就够了，其余一律 `REP_GENERAL_FAILURE`。
+const fn reply_of(code: SessionCode) -> u8 {
+    match code {
+        SessionCode::Ok => socks::REP_SUCCEEDED,
+        SessionCode::Refused => socks::REP_CONNECTION_REFUSED,
+        SessionCode::Timeout => socks::REP_TTL_EXPIRED,
+        SessionCode::NotFound => socks::REP_HOST_UNREACHABLE,
+        SessionCode::Denied => socks::REP_NOT_ALLOWED,
+    }
+}
+
 // —————————————————————————————————————————————— 后台监听任务
 
 /// SOCKS5 监听循环：每条连接一个会话键，交给 `serve_connect`。
@@ -1112,14 +1127,30 @@ async fn run_socks(
                     peer,
                 )
                 .await;
-            // 回包顺序说明见 `Console::socks` 的输出提示：严格版要等
-            // SessionReady，而引擎事件流由控制台独占（`serve_connect`
-            // 需要 `UnboundedReceiver<Message>`），留待 P7 事件泵接线。
-            let reply = socks::Reply::succeeded(std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+            // 对端确认「出口已经建起来了」之后才回 REP（plan §4.14 E18）：
+            // 先回成功再拨号正是 v1 `admin/handler/socks.go:204` 的缺陷。
+            let code = match handle.await_ready(key).await {
+                Ok(code) => code,
+                Err(_) => {
+                    let reply = socks::Reply::new(socks::REP_GENERAL_FAILURE);
+                    let _ = client.write_all(&reply.encode()).await;
+                    let _ = client.flush().await;
+                    return;
+                }
+            };
+            let reply = match code {
+                SessionCode::Ok => {
+                    socks::Reply::succeeded(std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
+                }
+                other => socks::Reply::new(reply_of(other)),
+            };
             if client.write_all(&reply.encode()).await.is_err() {
                 return;
             }
             if client.flush().await.is_err() {
+                return;
+            }
+            if code != SessionCode::Ok {
                 return;
             }
             let (out, _inbound) = mpsc::channel(64);
@@ -1152,6 +1183,11 @@ async fn run_forward(
                 Err(_) => return,
             };
             let _ = handle.send(run, peer).await;
+            // forward 也要等对端确认出口可达（plan §4.14 E18），
+            // 否则本地连接会已经开始灌数据而远端还没开始拨。
+            if !matches!(handle.await_ready(key).await, Ok(SessionCode::Ok)) {
+                return;
+            }
             let (out, _inbound) = mpsc::channel(64);
             let mut client = client;
             let _ = socks_server::pump(&mut session, &mut client, &out, key, peer).await;
