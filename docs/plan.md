@@ -541,6 +541,7 @@ pub enum SessionDirection { Outbound, Inbound }   // 相对**接收方**：Outbo
 | E19 | §4.6 服务请求带目标地址 | `ServiceRequest` **不含** `target`；地址一律随 `OpenSession.target` 下发，服务执行器按会话键记住它 | 目标地址是会话级属性（同一条会话的所有 Probe/Run 都指向同一目标），放进每条请求会重复且可能与会话不一致 |
 | E20 | 附录 A 的 `LISTENREQ`/`BACKWARDTEST` 在 P6 只要求命令可用 | P6 交付命令解析、参数校验与 `Probe`（返回真前置条件）；**Run 阶段显式返回 `Refused` 并说明是 P7 联调项** | `listen` 与 `backward` 的执行要装配新链路（共享同一编号分配器 + 传输层监听），那是运行时职责；探测说「可以」而执行说「没做」必须让调用方看得见，不能静默成功 |
 | E21 | §4.10 控制台「两级面板 + 22 命令」 | `command.rs` 的 `parse` 与 `render.rs` 的按键/渲染与网络完全解耦：`render` 只产出 `Action::{None,Submit,Quit}`，执行在 `console.rs` | 让 TUI 可被 `TestBackend` 快照测试（53 条单测），也让 `--non-interactive` 复用同一个命令面而不必重写解析 |
+| E22 | §7 P6「11 个 blocking 组合出包」 | `xtask build-matrix` 按 11 组合**逐条判定并实跑**，但本机只有 `x86_64-unknown-linux-gnu` 与 `x86_64-unknown-linux-musl` 两个 target、无交叉 gcc 与 32 位链接器，`rustup target add` 又因 `/` 只读失败 → **实跑能出的是 linux/x86_64 的 agent 与 admin 两件，其余 18 项报 `skipped` 并给出该 triple 缺失的原因**；`skipped` 不置非 0 退出码，真正的 11 组合出包须在 CI 矩阵上验证 | 判据本身没变（仍是 11 组合），变的是「本机能证明到哪一步」。把 skipped 与 failed 区分开，才能让本机结果既诚实又不掩盖真正该失败的组合 |
 
 ---
 
