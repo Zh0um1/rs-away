@@ -2867,6 +2867,7 @@ dependencies = [
  "clap",
  "crossterm",
  "ratatui",
+ "sha2",
  "stowaway-core",
  "stowaway-crypto",
  "stowaway-protocol",

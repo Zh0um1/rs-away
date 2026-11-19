@@ -29,6 +29,54 @@ pub const FILE_CHUNK: usize = 64 * 1024;
 /// 文件名长度上限。
 pub const MAX_NAME_LEN: usize = 255;
 
+/// 下载方向的清单头长度：8 字节长度（LE）+ 32 字节 sha256。
+///
+/// 接收方在下载时**不知道**远端文件多大、摘要是什么，所以发送方必须在
+/// 任何分片之前先声明：`size ‖ sha256` 是会话流里的第一段 40 字节。
+/// 这与 v1 的 `FILEDOWNRES`（先包头、再 `FILEDATA`，见
+/// `share/file.go:262` 的 `Ask4Download`）同构，只是把「包头」压成了定长。
+pub const MANIFEST_LEN: usize = 8 + 32;
+
+/// 造清单头。
+#[must_use]
+pub fn manifest(size: u64, sha256: &[u8; 32]) -> [u8; MANIFEST_LEN] {
+    let mut out = [0u8; MANIFEST_LEN];
+    out[..8].copy_from_slice(&size.to_le_bytes());
+    out[8..].copy_from_slice(sha256);
+    out
+}
+
+/// 解清单头。
+#[must_use]
+pub fn parse_manifest(head: &[u8; MANIFEST_LEN]) -> (u64, [u8; 32]) {
+    let mut len = [0u8; 8];
+    len.copy_from_slice(&head[..8]);
+    let mut sha = [0u8; 32];
+    sha.copy_from_slice(&head[8..]);
+    (u64::from_le_bytes(len), sha)
+}
+
+/// 流式计算一个文件的 sha256（不把整文件读进内存）。
+///
+/// # Errors
+/// 打不开或读不动时把底层 `io::Error` 原样带回。
+pub async fn sha256_file(path: &Path) -> std::io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; FILE_CHUNK];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
 /// 文件名/落盘错误。
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -323,6 +371,7 @@ mod tests {
             size,
             sha256: [0u8; 32],
             offset: 0,
+            direction: stowaway_protocol::FileDirection::Upload,
         }
     }
 

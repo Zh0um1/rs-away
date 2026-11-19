@@ -26,8 +26,8 @@ use stowaway_core::{
 };
 use stowaway_crypto::Secret;
 use stowaway_protocol::{
-    ByteBuf, FileParam as ProtoFileParam, Message, NodeId, NodeKind, OpenSession, ServiceData,
-    SessionCode, SessionDirection, SessionKey, SessionKind, TransportKind,
+    ByteBuf, FileDirection, FileParam as ProtoFileParam, Message, NodeId, NodeKind, OpenSession,
+    ServiceData, SessionCode, SessionDirection, SessionKey, SessionKind, TransportKind,
 };
 use stowaway_transport::{Link, LinkCodec, LinkMeta, boxed};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
@@ -472,6 +472,7 @@ async fn scenario_5_file_transfer_rejects_traversal() {
         size: 5,
         sha256: [0u8; 32],
         offset: 0,
+        direction: FileDirection::Upload,
     };
     let mut incoming =
         IncomingFile::new(SessionKey::new(NodeId::ADMIN, 40), &dir, &ok).expect("new");
@@ -490,6 +491,7 @@ async fn scenario_5_file_transfer_rejects_traversal() {
             size: 1,
             sha256: [0u8; 32],
             offset: 0,
+            direction: FileDirection::Upload,
         };
         assert!(
             IncomingFile::new(SessionKey::new(NodeId::ADMIN, 41), &dir, &param).is_err(),
@@ -503,6 +505,7 @@ async fn scenario_5_file_transfer_rejects_traversal() {
         size: 1,
         sha256: [0u8; 32],
         offset: 0,
+        direction: FileDirection::Upload,
     };
     assert_eq!(proto.name, "x");
     let _ = std::fs::remove_dir_all(&dir);

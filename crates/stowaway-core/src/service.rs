@@ -25,9 +25,9 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use stowaway_protocol::{
-    ConnectParam, FileParam, Message, NodeId, ServiceData, ServiceExit, ServiceKind, ServiceParam,
-    ServicePhase, ServiceReply, ServiceRequest, SessionCode, SessionKey, SessionKind, ShellParam,
-    SshParam, SshTunnelParam,
+    ConnectParam, FileDirection, FileParam, Message, NodeId, ServiceData, ServiceExit, ServiceKind,
+    ServiceParam, ServicePhase, ServiceReply, ServiceRequest, SessionCode, SessionKey, SessionKind,
+    ShellParam, SshParam, SshTunnelParam,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
@@ -360,19 +360,29 @@ impl Services {
     }
 
     async fn run_file(&self, key: SessionKey, from: NodeId, param: FileParam) -> Outcome {
+        // 方向决定「谁发谁收」：`ServiceRequest` 没有 direction 字段（那是
+        // `OpenSession` 的属性），所以方向随 `FileParam.direction` 一起给
+        // （plan §4.14 E25）。
+        match param.direction {
+            FileDirection::Upload => self.run_file_upload(key, from, param).await,
+            FileDirection::Download => self.run_file_download(key, from, param).await,
+        }
+    }
+
+    /// 上传：对端推数据，本端落盘并校验。
+    async fn run_file_upload(&self, key: SessionKey, from: NodeId, param: FileParam) -> Outcome {
         let root = &self.config.download_dir;
         if param.size > 0 && param.sha256 == [0u8; 32] {
             return Outcome::failed(SessionCode::Denied, "缺少 sha256，拒绝无校验传输");
         }
-        let path = match crate::file::safe_join(root, &param.name) {
-            Ok(p) => p,
-            Err(e) => return Outcome::failed(SessionCode::Denied, format!("文件名不可用：{e}")),
-        };
-        // 逐块读会话流 → 写盘 → 记账，最后核对长度与摘要。
-        let mut file = match crate::file::IncomingFile::new(key, &path, &param) {
+        // `IncomingFile::new` 自己会做 `safe_join`：这里必须把**根目录**交给它，
+        // 不能先 join 再把它当 root 传进去——那会拼成 `<root>/<name>/<name>`，
+        // 于是 `File::create` 撞上刚被建出来的同名目录（`Is a directory`）。
+        let mut file = match crate::file::IncomingFile::new(key, root, &param) {
             Ok(f) => f,
             Err(e) => return Outcome::failed(SessionCode::Denied, format!("无法落盘：{e}")),
         };
+        let path = file.path.clone();
         let mut hasher = Sha256::new();
         // 打开一次、顺序追加：早先在这里对每块都 `fs::write`，那是**整文件覆盖**，
         // 第二块就把第一块盖掉（plan §8.5 场景 5 会立刻暴露）。`write_all` 到同一个
@@ -434,6 +444,102 @@ impl Services {
         Outcome::ok(
             format!("已写入 {}（{received} 字节）", path.display()),
             (received, 0),
+        )
+    }
+
+    /// 下载：本端读文件、先发清单头再发分片。
+    ///
+    /// 接收方在下载方向**不可能**预先知道长度与摘要，所以先把
+    /// [`crate::file::manifest`] 的 40 字节写进流（`size ‖ sha256`），
+    /// 之后才是分片；对端按清单校验（plan §4.14 E25）。
+    ///
+    /// 只允许读 `--download-dir` 下的单段文件名：下载方向同样受
+    /// [`crate::file::validate_name`] 约束。读任意路径不写盘、危害小于
+    /// 上传，但「能读 `/etc/shadow`」本身就是越权，规则一致更好讲。
+    async fn run_file_download(&self, key: SessionKey, from: NodeId, param: FileParam) -> Outcome {
+        let path = match crate::file::safe_join(&self.config.download_dir, &param.name) {
+            Ok(p) => p,
+            Err(e) => {
+                let detail = format!("文件名不可用：{e}");
+                self.confirm(key, from, SessionKind::File, SessionCode::Denied, &detail)
+                    .await;
+                return Outcome::failed(SessionCode::Denied, detail);
+            }
+        };
+        let meta = match tokio::fs::metadata(&path).await {
+            Ok(m) if m.is_file() => m,
+            Ok(_) => {
+                let detail = format!("{} 不是普通文件", path.display());
+                self.confirm(key, from, SessionKind::File, SessionCode::NotFound, &detail)
+                    .await;
+                return Outcome::failed(SessionCode::NotFound, detail);
+            }
+            Err(e) => {
+                let detail = format!("打不开 {}：{e}", path.display());
+                self.confirm(key, from, SessionKind::File, SessionCode::NotFound, &detail)
+                    .await;
+                return Outcome::failed(SessionCode::NotFound, detail);
+            }
+        };
+        let size = meta.len();
+        let digest = match crate::file::sha256_file(&path).await {
+            Ok(d) => d,
+            Err(e) => {
+                let detail = format!("读 {} 失败：{e}", path.display());
+                self.confirm(key, from, SessionKind::File, SessionCode::Refused, &detail)
+                    .await;
+                return Outcome::failed(SessionCode::Refused, detail);
+            }
+        };
+        // 先绑流再回 Ready（plan §4.14 E18）。
+        let mut session = match self.stream(key, from, SessionKind::File).await {
+            Ok(s) => s,
+            Err(e) => {
+                let detail = e.to_string();
+                self.confirm(key, from, SessionKind::File, SessionCode::Refused, &detail)
+                    .await;
+                return Outcome::failed(SessionCode::Refused, detail);
+            }
+        };
+        self.confirm(
+            key,
+            from,
+            SessionKind::File,
+            SessionCode::Ok,
+            &format!("准备发送 {}（{size} 字节）", path.display()),
+        )
+        .await;
+
+        // 清单头：对端据此建文件、算期望长度与摘要。
+        if let Err(e) = session
+            .write_all(&crate::file::manifest(size, &digest))
+            .await
+        {
+            return Outcome::failed(SessionCode::Refused, format!("写清单失败：{e}"));
+        }
+        let mut sink = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) => return Outcome::failed(SessionCode::Refused, format!("打开失败：{e}")),
+        };
+        let mut buf = vec![0u8; crate::file::FILE_CHUNK];
+        let mut sent = 0u64;
+        loop {
+            let n = match sink.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => return Outcome::failed(SessionCode::Refused, format!("读盘失败：{e}")),
+            };
+            if let Err(e) = session.write_all(&buf[..n]).await {
+                return Outcome::failed(SessionCode::Refused, format!("写会话失败：{e}"));
+            }
+            sent = sent.saturating_add(n as u64);
+        }
+        if let Err(e) = session.shutdown().await {
+            return Outcome::failed(SessionCode::Refused, format!("收尾失败：{e}"));
+        }
+        Outcome::ok(
+            format!("已发送 {}（{sent} 字节）", path.display()),
+            (0, sent),
         )
     }
 

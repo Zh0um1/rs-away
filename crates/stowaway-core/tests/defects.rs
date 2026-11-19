@@ -475,7 +475,7 @@ async fn defect_13_socks_with_credentials_never_falls_back_to_no_auth() {
 #[test]
 fn defect_13_file_name_validation_blocks_escape() {
     use stowaway_core::{IncomingFile, safe_join, validate_name};
-    use stowaway_protocol::FileParam;
+    use stowaway_protocol::{FileDirection, FileParam};
 
     let root = std::env::temp_dir().join("rs-away-defect13");
     std::fs::create_dir_all(&root).expect("mkdir");
@@ -501,6 +501,7 @@ fn defect_13_file_name_validation_blocks_escape() {
             size: 1,
             sha256: [0u8; 32],
             offset: 0,
+            direction: FileDirection::Upload,
         };
         assert!(
             IncomingFile::new(SessionKey::new(NodeId::ADMIN, 1), &root, &param).is_err(),
@@ -514,6 +515,7 @@ fn defect_13_file_name_validation_blocks_escape() {
         size: 3,
         sha256: [0u8; 32],
         offset: 0,
+        direction: FileDirection::Upload,
     };
     let f = IncomingFile::new(SessionKey::new(NodeId::ADMIN, 2), &root, &ok).expect("ok");
     assert_eq!(f.path.parent(), Some(root.as_path()));

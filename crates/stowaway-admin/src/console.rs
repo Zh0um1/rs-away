@@ -39,13 +39,14 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use stowaway_core::{EngineHandle, Event, NodeIdAllocator, Snapshot, forward, socks, socks_server};
 use stowaway_protocol::{
     ConnectParam, Memo, Message, NodeId, OpenSession, ServiceKind, ServiceParam, ServicePhase,
     ServiceRequest, SessionCode, SessionDirection, SessionKey, SessionKind, ShellParam, Shutdown,
     SshAuth, SshParam, SshTunnelParam,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -337,14 +338,8 @@ impl Console {
             Command::SshTunnel { ssh, agent_port } => self.ssh_tunnel(&ssh, agent_port).await,
             Command::Connect(addr) => self.connect(&addr).await,
             Command::Listen(spec) => self.listen(&spec).await,
-            Command::Upload { .. } => Outcome::unimplemented(
-                "upload",
-                "本端无法算 sha256，没有校验就不传，见 plan §4.14 E17",
-            ),
-            Command::Download { .. } => Outcome::unimplemented(
-                "download",
-                "本端无法算 sha256，没有校验就不传，见 plan §4.14 E17",
-            ),
+            Command::Upload { local, remote } => self.upload(&local, &remote).await,
+            Command::Download { remote, local } => self.download(&remote, local.as_deref()).await,
             Command::Shutdown => self.shutdown().await,
         }
     }
@@ -908,6 +903,284 @@ impl Console {
         )
     }
 
+    // —————————————————————————————————————————————— 文件
+
+    /// `upload <local> <remote>`：把本地文件推到当前节点。
+    ///
+    /// 顺序：本地算 `size`/`sha256`（**没有摘要就不传**，plan §4.14 E17 的
+    /// 原话是「本端无法算 sha256 就不传」，现在能算了）→ 探测
+    /// （`ServiceRequest{File, Probe}`）→ 登记会话 → 开流 → 发 Run →
+    /// 等 `SessionReady` → 分片写流。
+    ///
+    /// 摘要与长度都先在本地算好再发给对端，对端才有可校验的期望值；
+    /// 反过来（先传再算）等于事后补票，写坏的文件也已经落盘了。
+    async fn upload(&mut self, local: &str, remote: &str) -> Outcome {
+        let path = std::path::Path::new(local);
+        let size = match tokio::fs::metadata(path).await {
+            Ok(m) if m.is_file() => m.len(),
+            Ok(_) => return Outcome::fail(format!("{local} 不是普通文件")),
+            Err(e) => return Outcome::fail(format!("打不开 {local}：{e}")),
+        };
+        let remote_name = remote_name_of(remote);
+        if let Err(e) = stowaway_core::file::validate_name(&remote_name) {
+            return Outcome::fail(format!("远端文件名不可用：{e}"));
+        }
+        let digest = match stowaway_core::file::sha256_file(path).await {
+            Ok(d) => d,
+            Err(e) => return Outcome::fail(format!("计算 sha256 失败：{e}")),
+        };
+        let key = self.next_key();
+        let param = stowaway_protocol::FileParam {
+            name: remote_name,
+            size,
+            sha256: digest,
+            offset: 0,
+            direction: stowaway_protocol::FileDirection::Upload,
+        };
+        let mut notes = self.drain_events();
+        notes.push(format!(
+            "上传 {local} → {}（{size} 字节，sha256 {}）",
+            self.target().short(),
+            hex8(&digest)
+        ));
+        let (probe, more) = self
+            .probe_service(stowaway_core::file::request(key, &param), key, "文件探测")
+            .await;
+        notes.extend(more);
+        if let Err(e) = probe {
+            notes.push(format!("错误：{e}"));
+            return Outcome::lines(notes);
+        }
+        let target = self.target();
+        if let Err(e) = self.handle.register_session(key, SessionKind::File).await {
+            notes.push(format!("错误：会话无法登记：{e}"));
+            return Outcome::lines(notes);
+        }
+        let mut session = match self
+            .handle
+            .open_stream(key, target, SessionKind::File)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                notes.push(format!("错误：开流失败：{e}"));
+                return Outcome::lines(notes);
+            }
+        };
+        if let Err(e) = self
+            .handle
+            .send(stowaway_core::file::run(key, &param), target)
+            .await
+        {
+            notes.push(format!("错误：请求未发出：{e}"));
+            return Outcome::lines(notes);
+        }
+        match self.handle.await_ready(key).await {
+            Ok(SessionCode::Ok) => {}
+            Ok(other) => {
+                notes.push(format!("错误：对端拒绝上传：{other:?}"));
+                return Outcome::lines(notes);
+            }
+            Err(e) => {
+                notes.push(format!("错误：等就绪失败：{e}"));
+                return Outcome::lines(notes);
+            }
+        }
+        let mut file = match tokio::fs::File::open(path).await {
+            Ok(f) => f,
+            Err(e) => {
+                notes.push(format!("错误：打开 {local} 失败：{e}"));
+                return Outcome::lines(notes);
+            }
+        };
+        let mut buf = vec![0u8; stowaway_core::file::FILE_CHUNK];
+        let mut sent = 0u64;
+        loop {
+            let n = match file.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    notes.push(format!("错误：读 {local} 失败：{e}"));
+                    return Outcome::lines(notes);
+                }
+            };
+            if let Err(e) = session.write_all(&buf[..n]).await {
+                notes.push(format!("错误：写会话失败：{e}"));
+                return Outcome::lines(notes);
+            }
+            sent = sent.saturating_add(n as u64);
+        }
+        if let Err(e) = session.shutdown().await {
+            notes.push(format!("错误：收尾失败：{e}"));
+            return Outcome::lines(notes);
+        }
+        notes.push(format!("已发送 {sent} 字节，等待对端校验"));
+        // 校验在远端做，结果通过 `ServiceExit` 回来；等不到也要说清。
+        let (ev, more) = self
+            .wait_event("文件传输", FILE_TIMEOUT, |ev| match ev {
+                Event::ServiceExit { exit, .. } => exit.key == key,
+                Event::ServiceReply { reply, .. } => reply.key == key,
+                _ => false,
+            })
+            .await;
+        notes.extend(more);
+        match ev {
+            Some(Event::ServiceExit { exit, .. }) => notes.push(match exit.code {
+                SessionCode::Ok => format!("对端确认：{}", exit.detail),
+                other => format!("对端失败：{other:?}（{}）", exit.detail),
+            }),
+            Some(Event::ServiceReply { reply, .. }) => {
+                notes.push(format!("对端答复：{:?}（{}）", reply.code, reply.detail));
+            }
+            _ => notes.push("提示：未收到对端校验结果，传输可能仍在远端处理".to_owned()),
+        }
+        Outcome::lines(notes)
+    }
+
+    /// `download <remote> [local]`：把当前节点上的文件取回本地。
+    ///
+    /// 接收方不知道远端大小与摘要，所以由发送方在流首写 40 字节清单
+    /// （`size ‖ sha256`，[`stowaway_core::file::MANIFEST_LEN`]）。本端按
+    /// 清单校验：长度不符或摘要不符都不落成好文件（落到 `<name>.part`
+    /// 后删除），这样「传坏一个文件」不会静默成功。
+    async fn download(&mut self, remote: &str, local: Option<&str>) -> Outcome {
+        let remote_name = remote_name_of(remote);
+        if let Err(e) = stowaway_core::file::validate_name(&remote_name) {
+            return Outcome::fail(format!("远端文件名不可用：{e}"));
+        }
+        let out_path = match local {
+            Some(p) => std::path::PathBuf::from(p),
+            None => std::path::PathBuf::from(remote_name.as_str()),
+        };
+        let key = self.next_key();
+        // 下载方向的 size/sha256 由发送方在清单头里给，这里先填占位。
+        let param = stowaway_protocol::FileParam {
+            name: remote_name,
+            size: 0,
+            sha256: [0u8; 32],
+            offset: 0,
+            direction: stowaway_protocol::FileDirection::Download,
+        };
+        let mut notes = self.drain_events();
+        notes.push(format!(
+            "下载 {}:{} → {}",
+            self.target().short(),
+            remote,
+            out_path.display()
+        ));
+        let (probe, more) = self
+            .probe_service(stowaway_core::file::request(key, &param), key, "文件探测")
+            .await;
+        notes.extend(more);
+        if let Err(e) = probe {
+            notes.push(format!("错误：{e}"));
+            return Outcome::lines(notes);
+        }
+        let target = self.target();
+        if let Err(e) = self.handle.register_session(key, SessionKind::File).await {
+            notes.push(format!("错误：会话无法登记：{e}"));
+            return Outcome::lines(notes);
+        }
+        let mut session = match self
+            .handle
+            .open_stream(key, target, SessionKind::File)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                notes.push(format!("错误：开流失败：{e}"));
+                return Outcome::lines(notes);
+            }
+        };
+        if let Err(e) = self
+            .handle
+            .send(stowaway_core::file::run(key, &param), target)
+            .await
+        {
+            notes.push(format!("错误：请求未发出：{e}"));
+            return Outcome::lines(notes);
+        }
+        match self.handle.await_ready(key).await {
+            Ok(SessionCode::Ok) => {}
+            Ok(other) => {
+                notes.push(format!("错误：对端拒绝发送：{other:?}"));
+                return Outcome::lines(notes);
+            }
+            Err(e) => {
+                notes.push(format!("错误：等就绪失败：{e}"));
+                return Outcome::lines(notes);
+            }
+        }
+        let mut head = [0u8; stowaway_core::file::MANIFEST_LEN];
+        if let Err(e) = session.read_exact(&mut head).await {
+            notes.push(format!("错误：读清单失败：{e}"));
+            return Outcome::lines(notes);
+        }
+        let (size, want) = stowaway_core::file::parse_manifest(&head);
+        notes.push(format!("远端声明 {size} 字节，sha256 {}", hex8(&want)));
+        let part = out_path.with_extension("part");
+        let mut sink = match tokio::fs::File::create(&part).await {
+            Ok(f) => f,
+            Err(e) => {
+                notes.push(format!("错误：创建 {} 失败：{e}", part.display()));
+                return Outcome::lines(notes);
+            }
+        };
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; stowaway_core::file::FILE_CHUNK];
+        let mut got = 0u64;
+        loop {
+            let n = match session.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    notes.push(format!("错误：读会话失败：{e}"));
+                    let _ = tokio::fs::remove_file(&part).await;
+                    return Outcome::lines(notes);
+                }
+            };
+            hasher.update(&buf[..n]);
+            if let Err(e) = sink.write_all(&buf[..n]).await {
+                notes.push(format!("错误：写盘失败：{e}"));
+                let _ = tokio::fs::remove_file(&part).await;
+                return Outcome::lines(notes);
+            }
+            got = got.saturating_add(n as u64);
+        }
+        if let Err(e) = sink.flush().await {
+            notes.push(format!("错误：落盘失败：{e}"));
+            let _ = tokio::fs::remove_file(&part).await;
+            return Outcome::lines(notes);
+        }
+        drop(sink);
+        let actual: [u8; 32] = hasher.finalize().into();
+        if got != size {
+            let _ = tokio::fs::remove_file(&part).await;
+            notes.push(format!("错误：长度不符（收到 {got}，声明 {size}），已丢弃"));
+            return Outcome::lines(notes);
+        }
+        if actual != want {
+            let _ = tokio::fs::remove_file(&part).await;
+            notes.push(format!(
+                "错误：sha256 不符（{} ≠ {}），已丢弃",
+                hex8(&actual),
+                hex8(&want)
+            ));
+            return Outcome::lines(notes);
+        }
+        match tokio::fs::rename(&part, &out_path).await {
+            Ok(()) => notes.push(format!(
+                "已保存 {}（{got} 字节，校验通过）",
+                out_path.display()
+            )),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&part).await;
+                notes.push(format!("错误：改名失败：{e}"));
+            }
+        }
+        Outcome::lines(notes)
+    }
+
     // —————————————————————————————————————————————— 其它
 
     /// `listen [ip:]<port>`：在 agent 上被动监听（P7 联调项）。
@@ -1002,6 +1275,29 @@ fn event_note(ev: &Event) -> Option<String> {
         | Event::ServiceExit { .. }
         | Event::Rtt { .. } => None,
     }
+}
+
+/// 文件传输的整体超时：分片 + 对端校验都在里面。
+const FILE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 远端路径的 base name（`upload`/`download` 都只认单段文件名）。
+fn remote_name_of(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(trimmed)
+        .to_owned()
+}
+
+/// 摘要前 8 字节的 hex（只用于提示行，不是安全边界）。
+fn hex8(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(16);
+    for b in &bytes[..8] {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// 取出消息带的会话键（服务请求/会话相关消息才有）。
