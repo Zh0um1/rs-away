@@ -23,6 +23,7 @@
 // 库代码禁止直接打印（由二进制/调用方决定输出方式）。
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+pub mod alloc;
 pub mod backward;
 pub mod bridge;
 pub mod dispatch;
