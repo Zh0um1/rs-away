@@ -354,10 +354,15 @@ pub struct SessionClose {
 
 // ————————————————————————— 定义块：Service 族 —————————————————————————
 
-/// 服务种类（forward/backward 的探测复用 `Connect`）。
+/// 服务种类。
+///
+/// forward 的探测复用 [`ServiceKind::Connect`]（语义相同：拨一个目标看通不通）；
+/// 但 backward 与 listen **不能**复用——前者要在被监听侧真正 `bind` 一个端口，
+/// 后者要让 agent 在指定端口发起被动服务，两者与「拨号」是相反的动作
+/// （见 `docs/plan.md` 附录 A 第 12、39 行）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum ServiceKind {
-    /// 文件传输。
+    /// 文件传输（上传/下载共用，方向由 `SessionDirection` 决定）。
     #[default]
     File,
     /// 交互式 shell。
@@ -368,6 +373,10 @@ pub enum ServiceKind {
     SshTunnel,
     /// 连通性探测 / 通用 TCP 桥（v1 的 `connect` 与 `FORWARDTEST`）。
     Connect,
+    /// 被动监听：让对端在指定端口上 `bind` 并接受连接（v1 `LISTENREQ`）。
+    Listen,
+    /// 反向映射：被监听侧 `bind` 端口，发起侧拨号回来（v1 `BACKWARDTEST`）。
+    Backward,
 }
 
 /// 服务阶段：先探测再执行，消除 v1「先注册数据通道再发 START」的顺序耦合

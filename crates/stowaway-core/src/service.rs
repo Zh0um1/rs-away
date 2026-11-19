@@ -210,6 +210,16 @@ impl Services {
                     move |s| Box::pin(async move { s.run_connect(req.key, from, addr).await }),
                 )))
             }
+            // `listen` 与 `backward` 的 Run 阶段要装配新链路（共享编号分配器 + 传输层
+            // 监听），那是运行时职责而非服务职责；P6 只交付命令、参数校验与 Probe，
+            // 执行在 P7 联调阶段补（见 docs/plan.md §4.14 E17）。这里显式失败，
+            // 不静默成功——探测说「可以」而执行说「没做」必须让调用方看得见。
+            (ServicePhase::Run, kind @ (ServiceKind::Listen | ServiceKind::Backward)) => {
+                let addr = connect_addr(&req.param)?;
+                Ok(Some(self.spawn(req.key, from, kind, move |s| {
+                    Box::pin(async move { s.run_deferred(req.key, from, kind, addr).await })
+                })))
+            }
         }
     }
 
@@ -237,6 +247,8 @@ impl Services {
             ServiceKind::Shell => "可创建 PTY".to_owned(),
             ServiceKind::Ssh => format!("host key 策略 {}", self.config.host_key_policy.as_tag()),
             ServiceKind::SshTunnel | ServiceKind::Connect => "可拨号".to_owned(),
+            ServiceKind::Listen => "可在指定端口被动监听".to_owned(),
+            ServiceKind::Backward => "可做反向映射".to_owned(),
         };
         let reply = Message::ServiceReply(ServiceReply {
             key,
@@ -252,6 +264,21 @@ impl Services {
     }
 
     // —— 各服务 ——
+
+    /// `listen` / `backward` 的执行体（P6 显式拒绝，见 [`Self::handle`] 的注释）。
+    async fn run_deferred(
+        &self,
+        key: SessionKey,
+        from: NodeId,
+        kind: ServiceKind,
+        addr: String,
+    ) -> Outcome {
+        let _ = (key, from);
+        Outcome::failed(
+            SessionCode::Refused,
+            format!("{kind:?} 的执行尚未接通（{addr}）：P6 只交付命令与探测，见 plan §4.14 E17"),
+        )
+    }
 
     async fn run_connect(&self, key: SessionKey, from: NodeId, addr: String) -> Outcome {
         let local = match dial_target(&addr).await {
