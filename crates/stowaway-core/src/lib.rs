@@ -27,6 +27,7 @@ pub mod alloc;
 pub mod backward;
 pub mod bridge;
 pub mod dispatch;
+pub mod engine;
 pub mod error;
 pub mod file;
 pub mod forward;
