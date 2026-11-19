@@ -14,6 +14,8 @@
 pub mod cli;
 /// 命令解析（主面板 5 条 + 节点面板 20 条；不依赖 ratatui）。
 pub mod command;
+/// 控制台命令执行层（把解析出的 `Command` 变成真实网络动作）。
+pub mod console;
 /// 命令历史（三份独立列表，不依赖 ratatui）。
 pub mod history;
 /// 控制台 TUI 渲染层（只在 `tui` feature 下编译）。
