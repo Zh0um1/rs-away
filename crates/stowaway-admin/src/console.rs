@@ -602,7 +602,11 @@ impl Console {
             notes.push(format!("错误：shell 未开启：{e}"));
             return Outcome::lines(notes);
         }
-        match self.handle.open_stream(key, target).await {
+        match self
+            .handle
+            .open_stream(key, target, SessionKind::ShellPty)
+            .await
+        {
             Ok(stream) => {
                 let k = stream.key();
                 notes.push(format!(
@@ -1131,7 +1135,7 @@ async fn run_socks(
             {
                 return;
             }
-            let mut session = match handle.open_stream(key, peer).await {
+            let mut session = match handle.open_stream(key, peer, SessionKind::Socks5).await {
                 Ok(s) => s,
                 Err(_) => return,
             };
@@ -1206,7 +1210,7 @@ async fn run_forward(
             {
                 return;
             }
-            let mut session = match handle.open_stream(key, peer).await {
+            let mut session = match handle.open_stream(key, peer, SessionKind::Forward).await {
                 Ok(s) => s,
                 Err(_) => return,
             };

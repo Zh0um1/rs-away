@@ -26,8 +26,8 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use stowaway_protocol::{
     ConnectParam, FileParam, Message, NodeId, ServiceData, ServiceExit, ServiceKind, ServiceParam,
-    ServicePhase, ServiceReply, ServiceRequest, SessionCode, SessionKey, ShellParam, SshParam,
-    SshTunnelParam,
+    ServicePhase, ServiceReply, ServiceRequest, SessionCode, SessionKey, SessionKind, ShellParam,
+    SshParam, SshTunnelParam,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
@@ -258,25 +258,43 @@ impl Services {
         let _ = self.engine.send(reply, from).await;
     }
 
-    /// 开一条会话流；会话未登记 / 已绑定都报错。
+    /// 开一条会话流；会话未登记时补登记（绑定即接受）。
     ///
-    /// **调用前必须先 [`Self::confirm`]**（plan §4.14 E18）：会话在对端
-    /// 眼里是 `Opening`，只有我们回过 `SessionReady` 它才允许发数据；反过
-    /// 来，我们回 `Ok` 也必须以「出口确实建起来了」为前提，否则就是把
-    /// v1 `admin/handler/socks.go:204` 的「先回成功再拨号」搬进 v2。
-    async fn stream(&self, key: SessionKey, from: NodeId) -> Result<SessionStream> {
-        self.engine.open_stream(key, from).await
+    /// 顺序（plan §4.14 E18）：**先 `stream`、再 [`Self::confirm`]**。反过来
+    /// 发起方一收到 `Ok` 就会开写，而这边还没有接收者，第一批数据必被丢成
+    /// 「尚未就绪」。`ServiceRequest` 驱动的服务（connect/file/shell/ssh）
+    /// 从没有 `OpenSession` 帮它登记会话，所以 `kind` 必须随流一起给出。
+    async fn stream(
+        &self,
+        key: SessionKey,
+        from: NodeId,
+        kind: stowaway_protocol::SessionKind,
+    ) -> Result<SessionStream> {
+        self.engine.open_stream(key, from, kind).await
     }
 
     /// 回报会话就绪/失败（顺序见 [`Self::stream`] 的说明）。
-    async fn confirm(&self, key: SessionKey, from: NodeId, code: SessionCode, detail: &str) {
+    async fn confirm(
+        &self,
+        key: SessionKey,
+        from: NodeId,
+        kind: SessionKind,
+        code: SessionCode,
+        detail: &str,
+    ) {
+        // 失败路径从来没建过流，会话也就没登记过；不补登记就推不动状态，
+        // `sessions.ready` 报 `UnknownSession`、Ready 根本发不出去，发起方
+        // 只能等到超时——失败也必须把码送回去（plan §4.14 E18）。
+        if let Err(e) = self.engine.ensure_session(key, kind).await {
+            tracing::warn!("会话 {key:?} 无法登记，{} 送不回去：{e}", code_tag(code));
+            return;
+        }
         if let Err(e) = self
             .engine
             .ready_session(key, from, code, detail.to_owned())
             .await
         {
-            // 回不了 Ready 说明链路已经断了：记一行日志即可，调用方随后
-            // 会因为 open_stream 失败走同一失败分支。
+            // 到这一步还失败，说明链路已经断了。
             tracing::warn!("回报会话 {key:?} 的 {} 失败：{e}", code_tag(code));
         }
     }
@@ -304,17 +322,36 @@ impl Services {
             Err(e) => {
                 let code = dial_code(&e);
                 let detail = format!("拨号 {addr} 失败：{e}");
-                self.confirm(key, from, code, &detail).await;
+                self.confirm(key, from, SessionKind::Socks5, code, &detail)
+                    .await;
                 return Outcome::failed(code, detail);
             }
         };
-        // 出口已经建起来，现在才敢对发起方说「可以发数据了」。
-        self.confirm(key, from, SessionCode::Ok, &format!("已连上 {addr}"))
-            .await;
-        let mut session = match self.stream(key, from).await {
+        // 先把会话流绑到本端（`Node::bind_session`）**再**回「可以发数据了」：
+        // 反过来会让发起方收到 Ready 就开写，而这边还没有接收者（plan §4.14 E18）。
+        let mut session = match self.stream(key, from, SessionKind::Socks5).await {
             Ok(s) => s,
-            Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
+            Err(e) => {
+                let detail = e.to_string();
+                self.confirm(
+                    key,
+                    from,
+                    SessionKind::Socks5,
+                    SessionCode::Refused,
+                    &detail,
+                )
+                .await;
+                return Outcome::failed(SessionCode::Refused, detail);
+            }
         };
+        self.confirm(
+            key,
+            from,
+            SessionKind::Socks5,
+            SessionCode::Ok,
+            &format!("已连上 {addr}"),
+        )
+        .await;
         let mut local = local;
         match relay_stream(&mut session, &mut local).await {
             Ok(bytes) => Outcome::ok(format!("{addr} 转发结束"), bytes),
@@ -344,18 +381,25 @@ impl Services {
             Ok(f) => f,
             Err(e) => return Outcome::failed(SessionCode::Refused, format!("创建文件失败：{e}")),
         };
-        // 目标文件已经打开，才敢对发起方说「可以发数据了」（plan §4.14 E18）。
+        // 先把会话流绑到本端（`Node::bind_session`）**再**回「可以发数据了」：
+        // 反过来会让发起方收到 Ready 就开写，而这边还没有接收者（plan §4.14 E18）。
+        let mut session = match self.stream(key, from, SessionKind::File).await {
+            Ok(s) => s,
+            Err(e) => {
+                let detail = e.to_string();
+                self.confirm(key, from, SessionKind::File, SessionCode::Refused, &detail)
+                    .await;
+                return Outcome::failed(SessionCode::Refused, detail);
+            }
+        };
         self.confirm(
             key,
             from,
+            SessionKind::File,
             SessionCode::Ok,
             &format!("可写入 {}", path.display()),
         )
         .await;
-        let mut session = match self.stream(key, from).await {
-            Ok(s) => s,
-            Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
-        };
         let mut buf = vec![0u8; crate::file::FILE_CHUNK];
         let mut received = 0u64;
         loop {
@@ -399,22 +443,42 @@ impl Services {
             Ok(p) => p,
             Err(e) => {
                 let detail = format!("PTY 起不来：{e}");
-                self.confirm(key, from, SessionCode::Refused, &detail).await;
+                self.confirm(
+                    key,
+                    from,
+                    SessionKind::ShellPty,
+                    SessionCode::Refused,
+                    &detail,
+                )
+                .await;
                 return Outcome::failed(SessionCode::Refused, detail);
             }
         };
-        // PTY 已经起来，才回「可以发按键了」（plan §4.14 E18）。
+        // 先把会话流绑到本端（`Node::bind_session`）**再**回「可以发数据了」：
+        // 反过来会让发起方收到 Ready 就开写，而这边还没有接收者（plan §4.14 E18）。
+        let mut session = match self.stream(key, from, SessionKind::ShellPty).await {
+            Ok(s) => s,
+            Err(e) => {
+                let detail = e.to_string();
+                self.confirm(
+                    key,
+                    from,
+                    SessionKind::ShellPty,
+                    SessionCode::Refused,
+                    &detail,
+                )
+                .await;
+                return Outcome::failed(SessionCode::Refused, detail);
+            }
+        };
         self.confirm(
             key,
             from,
+            SessionKind::ShellPty,
             SessionCode::Ok,
             &format!("PTY {}x{}", param.cols, param.rows),
         )
         .await;
-        let mut session = match self.stream(key, from).await {
-            Ok(s) => s,
-            Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
-        };
         let mut up = 0u64;
         let mut down = 0u64;
         let mut inbuf = vec![0u8; crate::shell::SHELL_READ_BUF];
@@ -481,22 +545,30 @@ impl Services {
                 Ok(s) => s,
                 Err(e) => {
                     let detail = format!("SSH 失败：{e}");
-                    self.confirm(key, from, SessionCode::Refused, &detail).await;
+                    self.confirm(key, from, SessionKind::Ssh, SessionCode::Refused, &detail)
+                        .await;
                     return Outcome::failed(SessionCode::Refused, detail);
                 }
             };
-            // SSH 通道已经开出来，才回「可以发按键了」（plan §4.14 E18）。
+            // 先把会话流绑到本端（`Node::bind_session`）**再**回「可以发数据了」：
+            // 反过来会让发起方收到 Ready 就开写，而这边还没有接收者（plan §4.14 E18）。
+            let mut session = match self.stream(key, from, SessionKind::Ssh).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let detail = e.to_string();
+                    self.confirm(key, from, SessionKind::Ssh, SessionCode::Refused, &detail)
+                        .await;
+                    return Outcome::failed(SessionCode::Refused, detail);
+                }
+            };
             self.confirm(
                 key,
                 from,
+                SessionKind::Ssh,
                 SessionCode::Ok,
                 &format!("SSH 交互会话就绪（{addr}）"),
             )
             .await;
-            let mut session = match self.stream(key, from).await {
-                Ok(s) => s,
-                Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
-            };
             let mut up = 0u64;
             let mut down = 0u64;
             let mut buf = vec![0u8; 4096];
@@ -535,22 +607,30 @@ impl Services {
             Ok(out) => out,
             Err(e) => {
                 let detail = format!("SSH 失败：{e}");
-                self.confirm(key, from, SessionCode::Refused, &detail).await;
+                self.confirm(key, from, SessionKind::Ssh, SessionCode::Refused, &detail)
+                    .await;
                 return Outcome::failed(SessionCode::Refused, detail);
             }
         };
-        // 命令已经跑完拿到输出，才回「可以接结果了」（plan §4.14 E18）。
+        // 先把会话流绑到本端（`Node::bind_session`）**再**回「可以发数据了」：
+        // 反过来会让发起方收到 Ready 就开写，而这边还没有接收者（plan §4.14 E18）。
+        let mut session = match self.stream(key, from, SessionKind::Ssh).await {
+            Ok(s) => s,
+            Err(e) => {
+                let detail = e.to_string();
+                self.confirm(key, from, SessionKind::Ssh, SessionCode::Refused, &detail)
+                    .await;
+                return Outcome::failed(SessionCode::Refused, detail);
+            }
+        };
         self.confirm(
             key,
             from,
+            SessionKind::Ssh,
             SessionCode::Ok,
             &format!("SSH 命令已执行（{addr}）"),
         )
         .await;
-        let mut session = match self.stream(key, from).await {
-            Ok(s) => s,
-            Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
-        };
         let n = out.output.len() as u64;
         if let Err(e) = session.write_all(&out.output).await {
             return Outcome::failed(SessionCode::Refused, format!("写会话失败：{e}"));
@@ -578,22 +658,42 @@ impl Services {
             Ok(v) => v,
             Err(e) => {
                 let detail = format!("SSH 隧道失败：{e}");
-                self.confirm(key, from, SessionCode::Refused, &detail).await;
+                self.confirm(
+                    key,
+                    from,
+                    SessionKind::SshTunnel,
+                    SessionCode::Refused,
+                    &detail,
+                )
+                .await;
                 return Outcome::failed(SessionCode::Refused, detail);
             }
         };
-        // direct-tcpip 通道已经建立，才回「可以发数据了」（plan §4.14 E18）。
+        // 先把会话流绑到本端（`Node::bind_session`）**再**回「可以发数据了」：
+        // 反过来会让发起方收到 Ready 就开写，而这边还没有接收者（plan §4.14 E18）。
+        let mut session = match self.stream(key, from, SessionKind::SshTunnel).await {
+            Ok(s) => s,
+            Err(e) => {
+                let detail = e.to_string();
+                self.confirm(
+                    key,
+                    from,
+                    SessionKind::SshTunnel,
+                    SessionCode::Refused,
+                    &detail,
+                )
+                .await;
+                return Outcome::failed(SessionCode::Refused, detail);
+            }
+        };
         self.confirm(
             key,
             from,
+            SessionKind::SshTunnel,
             SessionCode::Ok,
             &format!("SSH 隧道就绪 → {host}:{port}"),
         )
         .await;
-        let mut session = match self.stream(key, from).await {
-            Ok(s) => s,
-            Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
-        };
         let mut stream = channel.into_stream();
         let res = relay_stream(&mut session, &mut stream).await;
         conn.disconnect("stowaway tunnel closed").await.ok();

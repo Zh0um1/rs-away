@@ -155,12 +155,32 @@ pub enum Command {
         /// 回执。
         reply: oneshot::Sender<Result<()>>,
     },
+    /// 确保会话已登记（已登记则什么都不做）。
+    ///
+    /// 服务层的**失败路径**也要它：拨号失败时还没有任何流，若直接回
+    /// `SessionReady`，`sessions.ready` 会报 `UnknownSession`，发起方就等
+    /// 到超时——失败也必须能把错误码送回去（plan §4.14 E18）。
+    EnsureSession {
+        /// 会话键。
+        key: SessionKey,
+        /// 会话种类。
+        kind: stowaway_protocol::SessionKind,
+        /// 回执。
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// 打开一条会话流（引擎创建并绑定，返回可读写的流）。
+    ///
+    /// 应答方（`ServiceRequest` 驱动的那一侧）在开会话流时才真正「接受」
+    /// 这条会话：`ServiceRequest` 不像 `OpenSession` 那样先把会话登记进表，
+    /// 所以这里带 `kind`——缺了它，随后 `ready_session` 推进状态会报
+    /// `UnknownSession`，本端收到的第一块数据也会被判「尚未就绪」。
     OpenStream {
         /// 会话键。
         key: SessionKey,
         /// 会话对端。
         dest: NodeId,
+        /// 会话种类（应答方接受会话时用它登记）。
+        kind: stowaway_protocol::SessionKind,
         /// 回执。
         reply: oneshot::Sender<Result<SessionStream>>,
     },
@@ -403,16 +423,43 @@ impl EngineHandle {
         rx.await.map_err(|_| closed())?
     }
 
+    /// 确保会话已登记（已登记则什么都不做）。
+    ///
+    /// # Errors
+    /// 引擎已停止。
+    pub async fn ensure_session(
+        &self,
+        key: SessionKey,
+        kind: stowaway_protocol::SessionKind,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(Command::EnsureSession {
+                key,
+                kind,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| closed())?;
+        rx.await.map_err(|_| closed())?
+    }
+
     /// 打开一条会话流。
     ///
     /// # Errors
     /// 引擎已停止，或会话键已绑定。
-    pub async fn open_stream(&self, key: SessionKey, dest: NodeId) -> Result<SessionStream> {
+    pub async fn open_stream(
+        &self,
+        key: SessionKey,
+        dest: NodeId,
+        kind: stowaway_protocol::SessionKind,
+    ) -> Result<SessionStream> {
         let (tx, rx) = oneshot::channel();
         self.cmd
             .send(Command::OpenStream {
                 key,
                 dest,
+                kind,
                 reply: tx,
             })
             .await
@@ -771,8 +818,18 @@ impl Engine {
                 let _ = reply.send(res);
                 Ok(())
             }
-            Command::OpenStream { key, dest, reply } => {
-                let res = self.open_stream(key, dest);
+            Command::EnsureSession { key, kind, reply } => {
+                let res = self.ensure_session(key, kind);
+                let _ = reply.send(res);
+                Ok(())
+            }
+            Command::OpenStream {
+                key,
+                dest,
+                kind,
+                reply,
+            } => {
+                let res = self.open_stream(key, dest, kind);
                 let _ = reply.send(res);
                 Ok(())
             }
@@ -893,7 +950,29 @@ impl Engine {
     }
 
     /// 建会话流并绑定。
-    fn open_stream(&mut self, key: SessionKey, dest: NodeId) -> Result<SessionStream> {
+    ///
+    /// 会话若尚未登记（应答方由 `ServiceRequest` 驱动，从来没有 `OpenSession`
+    /// 帮它登记），这里补登记：绑定即接受，接受之后才可能推进到 `Open`。
+    /// 已登记的不覆盖（发起方登记的种类才是权威，两边各记各的）。
+    fn ensure_session(
+        &mut self,
+        key: SessionKey,
+        kind: stowaway_protocol::SessionKind,
+    ) -> Result<()> {
+        // 已登记的不覆盖：发起方登记的种类才是权威，两边各记各的。
+        if self.node.sessions().get(&key).is_none() {
+            self.node.register_session(key, kind)?;
+        }
+        Ok(())
+    }
+
+    fn open_stream(
+        &mut self,
+        key: SessionKey,
+        dest: NodeId,
+        kind: stowaway_protocol::SessionKind,
+    ) -> Result<SessionStream> {
+        self.ensure_session(key, kind)?;
         let (out_tx, mut out_rx) = mpsc::channel(crate::session::SESSION_QUEUE_DEPTH);
         let (stream, sink) =
             SessionStream::new(key, dest, out_tx, crate::session::SESSION_QUEUE_DEPTH);
@@ -1107,7 +1186,9 @@ mod tests {
         let task = tokio::spawn(engine.run());
         let key = stowaway_protocol::SessionKey::new(NodeId::ADMIN, 7);
         let far = NodeId::new([0x11; 16]);
-        let res = handle.open_stream(key, far).await;
+        let res = handle
+            .open_stream(key, far, stowaway_protocol::SessionKind::Socks5)
+            .await;
         assert!(res.is_ok(), "未登记也能建流，只在发数据时不可达");
         handle.shutdown().await.expect("shutdown");
         task.await.expect("join").expect("engine ok");

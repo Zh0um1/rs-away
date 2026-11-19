@@ -591,16 +591,23 @@ impl Node {
 
     /// 向某条链路直接发一条 `SessionReady`（业务层接受会话时用）。
     ///
+    /// 除了发消息，**本端的会话状态也要一起推进**：应答方此前只把会话登记成
+    /// `Opening`，若这里不把它推进到 `Open`，对端一发 `SessionData` 就会被
+    /// [`SessionTable::accept_data`] 判成「尚未就绪就收到数据」——服务层明明
+    /// 已经接受，协议层却坚持没接受。两侧必须同步推进，否则只靠「先绑流再回
+    /// Ready」是修不掉的（plan §4.14 E18）。
+    ///
     /// # Errors
-    /// 链路不存在。
+    /// 链路不存在，或会话未登记（[`CoreError::UnknownSession`]）。
     pub fn ready_session(
-        &self,
+        &mut self,
         peer: NodeId,
         key: SessionKey,
         code: SessionCode,
         detail: impl Into<String>,
     ) -> Result<()> {
         let entry = self.links.get(&peer).ok_or(CoreError::LinkClosed)?;
+        self.sessions.ready(&key, code)?;
         let msg = Message::SessionReady(stowaway_protocol::SessionReady {
             key,
             code,
