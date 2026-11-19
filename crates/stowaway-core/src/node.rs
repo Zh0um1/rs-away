@@ -10,7 +10,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use stowaway_protocol::{
     CloseReason, Heartbeat, Message, MsgType, NodeId, NodeKind, NodeScope, NodeState, NodeStatus,
-    OpenSession, SessionCode, SessionData, SessionKey, SessionKind,
+    OpenSession, ServiceData, ServiceExit, ServiceReply, ServiceRequest, SessionCode, SessionData,
+    SessionKey, SessionKind,
 };
 
 use crate::dispatch::{Route, decide, undeliverable_status};
@@ -426,7 +427,10 @@ impl Node {
                     });
                     let _ = entry.handle.try_send(reply, from, Vec::new());
                 }
-                Ok(Handled::Heartbeat { from })
+                Ok(Handled::Heartbeat {
+                    from,
+                    echo_ts: hb.echo_ts,
+                })
             }
             Message::Join(join) => {
                 // 两个用途（见 `Join::node` 的文档）：
@@ -527,10 +531,10 @@ impl Node {
             }
             Message::Shutdown(_) => Ok(Handled::Shutdown),
             Message::Memo(memo) => Ok(Handled::Memo { node: memo.node }),
-            Message::ServiceRequest(req) => Ok(Handled::ServiceRequest { key: req.key }),
-            Message::ServiceReply(reply) => Ok(Handled::ServiceReply { key: reply.key }),
-            Message::ServiceData(data) => Ok(Handled::ServiceData { key: data.key }),
-            Message::ServiceExit(exit) => Ok(Handled::ServiceExit { key: exit.key }),
+            Message::ServiceRequest(req) => Ok(Handled::ServiceRequest(req)),
+            Message::ServiceReply(reply) => Ok(Handled::ServiceReply(reply)),
+            Message::ServiceData(data) => Ok(Handled::ServiceData(data)),
+            Message::ServiceExit(exit) => Ok(Handled::ServiceExit(exit)),
             Message::Hello(_) | Message::HelloAck(_) | Message::AuthConfirm(_) => {
                 // 握手 flight 由 `LinkCodec` 在建立链路时消费；走到这里说明
                 // 对端在已建立的链路上又发了一次握手帧。
@@ -599,6 +603,8 @@ pub enum Handled {
     Heartbeat {
         /// 来源。
         from: NodeId,
+        /// 回显时间戳（0 表示这是探测、不是回显）。运行时据此算 RTT。
+        echo_ts: u64,
     },
     /// 已经转发给 `next_hop`。
     Forwarded {
@@ -644,24 +650,12 @@ pub enum Handled {
         /// 节点。
         node: NodeId,
     },
-    /// 服务请求。
-    ServiceRequest {
-        /// 键。
-        key: SessionKey,
-    },
+    /// 服务请求（携带完整请求：运行时按 `kind`/`phase`/`param` 分派）。
+    ServiceRequest(ServiceRequest),
     /// 服务响应。
-    ServiceReply {
-        /// 键。
-        key: SessionKey,
-    },
-    /// 服务数据。
-    ServiceData {
-        /// 键。
-        key: SessionKey,
-    },
+    ServiceReply(ServiceReply),
+    /// 服务数据（携带载荷：服务层不需要再回查节点状态）。
+    ServiceData(ServiceData),
     /// 服务退出。
-    ServiceExit {
-        /// 键。
-        key: SessionKey,
-    },
+    ServiceExit(ServiceExit),
 }
