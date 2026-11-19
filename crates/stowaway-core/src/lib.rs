@@ -34,6 +34,7 @@ pub mod file;
 pub mod forward;
 pub mod link_actor;
 pub mod node;
+pub mod reuse;
 pub mod runtime;
 pub mod service;
 pub mod session;
@@ -64,6 +65,12 @@ pub use forward::{
 };
 pub use link_actor::{LINK_BATCH_BYTES, LINK_BATCH_MS, LinkActor, LinkCommand};
 pub use node::{Node, NodeConfig};
+// `probe` 与 `forward::probe`（转发端口探测）同名，故在此处改名为 `probe_reuse`；
+// 需要原名时走 `stowaway_core::reuse::probe` 全路径。
+pub use reuse::{
+    CmdFailure, Fallback, REUSE_MAGIC_LEN, REUSE_SAME_SECONDS, ReuseConfig, ReuseError,
+    decide_fallback, install, platform_supported, probe as probe_reuse, uninstall,
+};
 pub use runtime::{Link, Runtime, RuntimeConfig, Side, accept, bind, dial, follow, lead, side_of};
 pub use service::{Outcome, ServiceConfig, ServiceTask, Services, relay_stream};
 pub use session::{SESSION_QUEUE_DEPTH, SessionMeta, SessionState, SessionTable};
