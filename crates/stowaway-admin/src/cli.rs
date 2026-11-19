@@ -154,9 +154,7 @@ impl Args {
     /// 端点缺失或冲突。
     pub fn mode(&self) -> Result<Mode, ArgsError> {
         match (&self.connect, self.listen) {
-            (Some(addr), None) => Ok(Mode::Active {
-                addr: addr.clone(),
-            }),
+            (Some(addr), None) => Ok(Mode::Active { addr: addr.clone() }),
             (None, Some(port)) => Ok(Mode::Passive { port }),
             (None, None) => Err(ArgsError::NoEndpoint),
             (Some(_), Some(_)) => Err(ArgsError::BothEndpoints),
