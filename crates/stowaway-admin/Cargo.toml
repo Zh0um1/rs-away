@@ -23,7 +23,8 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-ratatui = { workspace = true, optional = true }
+thiserror = { workspace = true }
+ratatui = { workspace = true, optional = true, features = ["crossterm_0_29"] }
 crossterm = { workspace = true, optional = true }
 
 [lints]
