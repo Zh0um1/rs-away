@@ -421,6 +421,21 @@ pub enum ServiceParam {
     Connect(ConnectParam),
 }
 
+/// 文件传输方向。
+///
+/// 上传与下载共用 [`ServiceKind::File`]，方向只能在这里表达：`ServiceRequest`
+/// 没有 `direction` 字段（那是 `OpenSession` 的属性），而文件传输走的是
+/// Service 族。分成两个 `ServiceKind` 会让响应方写两份几乎一样的「分块 +
+/// sha256」代码，见 `docs/plan.md` §4.14 E25。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum FileDirection {
+    /// 发起方发数据，响应方落盘（v1 的 `FILESTATREQ` + `FILEDATA`）。
+    #[default]
+    Upload,
+    /// 发起方请求文件，响应方读盘并回传（v1 的 `FILEDOWNREQ`）。
+    Download,
+}
+
 /// 文件传输参数。
 #[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct FileParam {
@@ -432,6 +447,8 @@ pub struct FileParam {
     pub sha256: [u8; 32],
     /// 起始偏移（支持续传；v2 新增）。
     pub offset: u64,
+    /// 传输方向（v2 新增，末位追加）。
+    pub direction: FileDirection,
 }
 
 /// shell 参数。
@@ -778,6 +795,7 @@ mod tests {
                     size: 4096,
                     sha256: [0xab; 32],
                     offset: 0,
+                    direction: FileDirection::Upload,
                 }),
             }),
             Message::ServiceReply(ServiceReply {
