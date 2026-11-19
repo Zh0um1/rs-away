@@ -522,6 +522,69 @@ fn defect_13_file_name_validation_blocks_escape() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// 缺陷 #10：v1 装了防火墙规则却不看每条命令的退出码
+/// （`agent/initial/method.go:260,277` 把 `exec.Command(...).Run()` 的返回值直接丢掉），
+/// 于是「无 root / 规则冲突」只会留下**半配置状态**而对外一片正常。
+///
+/// 这里把 `reuse_e2e.rs` 已经验证过的行为固定成 `defect_10_` 前缀的回归：
+/// 注入第 2 步失败，断言 ① 返回的错误带上**失败的步骤名与原始 stderr**，
+/// ② 已成功的第 1 步被**撤销**（不是留在系统里），③ 撤销序列是已装步骤的逆序。
+#[test]
+fn defect_10_failed_rule_reports_step_and_rolls_back() {
+    use std::cell::RefCell;
+    use stowaway_core::reuse::{CmdFailure, ReuseConfig, ReuseError, STEP_MARK_START, install_with};
+
+    let log: RefCell<Vec<Vec<String>>> = RefCell::new(Vec::new());
+    let injected = |argv: &[&str]| {
+        log.borrow_mut()
+            .push(argv.iter().map(|s| (*s).to_string()).collect());
+        // 只让**装机**的 `-A INPUT`（第 3 步「设开始标记」）失败；
+        // 卸载/回滚里的 `-D INPUT` 一律放过。
+        if argv.first() == Some(&"-A") && argv.get(1) == Some(&"INPUT") {
+            return Err(CmdFailure {
+                code: Some(1),
+                stderr: "注入失败：Permission denied (you must be root)".to_string(),
+            });
+        }
+        Ok(())
+    };
+
+    let cfg = ReuseConfig::new("defect-10-magic!", 41012, 41013).expect("配置合法");
+    let err = install_with(&cfg, &injected).expect_err("第 3 步失败必须整体报错，不能当成装好了");
+
+    // ① 错误里必须能看出「哪一步、为什么」——v1 连「失败了」都不知道。
+    match &err {
+        ReuseError::CommandFailed { step, code, stderr } => {
+            assert_eq!(*step, STEP_MARK_START, "失败的步骤名必须如实上报");
+            assert_eq!(*code, Some(1));
+            assert!(
+                stderr.contains("Permission denied"),
+                "原始 stderr 必须保留，实际：{stderr}"
+            );
+        }
+        other => panic!("预期 CommandFailed，实际：{other:?}"),
+    }
+
+    // ② ③ 已装步骤按逆序撤销：先撤链内的 REDIRECT（`-D <chain>`），再清链（`-F`）再删链（`-X`）。
+    let calls = log.borrow();
+    let failed_at = calls
+        .iter()
+        .rposition(|c| c.first().map(String::as_str) == Some("-A") && c.get(1).map(String::as_str) == Some("INPUT"))
+        .expect("应当有一次失败的 -A INPUT");
+    let undo = &calls[failed_at + 1..];
+    assert_eq!(undo.len(), 3, "该撤销 1 步 + 清链 + 删链，实际：{undo:?}");
+    assert_eq!(undo[0][..3], ["-t", "nat", "-D"], "先撤链内规则");
+    assert_eq!(undo[0][3], cfg.chain);
+    assert_eq!(undo[1][..3], ["-t", "nat", "-F"], "再清空自定义链");
+    assert_eq!(undo[2][..3], ["-t", "nat", "-X"], "最后删链");
+    assert!(
+        !undo
+            .iter()
+            .any(|c| c.first().map(String::as_str) == Some("-D") && c.get(1).map(String::as_str) == Some("INPUT")),
+        "从未成功的第 3 步不该出现在回滚里：{undo:?}"
+    );
+}
+
 /// 缺陷 #12：上游代理提前短响应（< 4 字节）会触发 v1 的
 /// `resultBuf[begin-4:begin]` 负索引 panic（`share/proxy.go:205`）。
 #[tokio::test]

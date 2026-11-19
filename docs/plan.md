@@ -870,11 +870,11 @@ P0 起每 push 跑：`fmt --check` / `clippy --workspace --all-targets --all-fea
 | 18 | `SSHEXIT` | `ServiceExit` | |
 | 19 | `SSHTUNNELREQ` | `ServiceRequest{kind: SshTunnel}` | |
 | 20 | `SSHTUNNELRES` | `ServiceReply` | |
-| 21 | `FILESTATREQ` | `ServiceRequest{kind: FileUpload, phase: Probe}` | 探测文件大小/分片数 |
+| 21 | `FILESTATREQ` | `ServiceRequest{kind: File, phase: Probe}` | 探测文件大小/分片数；方向由 `FileParam.direction = Upload` 表达（E17/E25） |
 | 22 | `FILESTATRES` | `ServiceReply` | |
 | 23 | `FILEDATA` | `ServiceData` | 分片 30720 → v2 64 KiB |
 | 24 | `FILEERR` | `ServiceExit{err}` | 错误改由统一的 exit reason 表达 |
-| 25 | `FILEDOWNREQ` | `ServiceRequest{kind: FileDownload}` | |
+| 25 | `FILEDOWNREQ` | `ServiceRequest{kind: File}`（`FileParam.direction = Download`） | 下载先发 40 字节清单头（`size LE ‖ sha256`），见 E25 |
 | 26 | `FILEDOWNRES` | `ServiceReply` | |
 | 27 | `SOCKSSTART` | `OpenSession{kind: Socks5, direction: Outbound}` | admin 发起 → agent 拨号 |
 | 28 | `SOCKSTCPDATA` | `SessionData` | 带 `seq` |
@@ -883,8 +883,8 @@ P0 起每 push 跑：`fmt --check` / `clippy --workspace --all-targets --all-fea
 | 31 | `UDPASSRES` | `SessionReady` | 携带绑定地址 |
 | 32 | `SOCKSTCPFIN` | `SessionClose{reason: Eof}` | 半关闭用 `flags.LAST` 表示，不用此消息 |
 | 33 | `SOCKSREADY` | `SessionReady{code: Ok}` | v1 无错误码 |
-| 34 | `FORWARDTEST` | `ServiceRequest{kind: Forward, phase: Probe}` | 保留探测语义（§4.8 两阶段） |
-| 35 | `FORWARDSTART` | `OpenSession{kind: Forward}` | Commit 阶段才发 |
+| 34 | `FORWARDTEST` | `ServiceRequest{kind: Connect, phase: Probe}` | forward 的探测**复用 `Connect`**（`ServiceKind::Forward` 不存在，见 `crates/stowaway-protocol/src/msg.rs` 的 `ServiceKind` 文档）；被探测端口随 `ConnectParam.addr` 给出 |
+| 35 | `FORWARDSTART` | `OpenSession{kind: Forward, direction: Outbound}` | Commit 阶段才发；`SessionKind::Forward` 存在，与探测用的 `ServiceKind::Connect` 分属两层 |
 | 36 | `FORWARDREADY` | `SessionReady` | |
 | 37 | `FORWARDDATA` | `SessionData` | |
 | 38 | `FORWARDFIN` | `SessionClose` | |
