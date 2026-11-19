@@ -288,6 +288,13 @@ impl Services {
             Err(e) => return Outcome::failed(SessionCode::Denied, format!("无法落盘：{e}")),
         };
         let mut hasher = Sha256::new();
+        // 打开一次、顺序追加：早先在这里对每块都 `fs::write`，那是**整文件覆盖**，
+        // 第二块就把第一块盖掉（plan §8.5 场景 5 会立刻暴露）。`write_all` 到同一个
+        // 句柄上才是「分块传输」的正确写法。
+        let mut sink = match tokio::fs::File::create(&path).await {
+            Ok(f) => f,
+            Err(e) => return Outcome::failed(SessionCode::Refused, format!("创建文件失败：{e}")),
+        };
         let mut buf = vec![0u8; crate::file::FILE_CHUNK];
         let mut received = 0u64;
         loop {
@@ -300,11 +307,16 @@ impl Services {
             if let Err(e) = file.accept(n) {
                 return Outcome::failed(SessionCode::Denied, format!("超出声明长度：{e}"));
             }
-            if let Err(e) = tokio::fs::write(&path, &buf[..n]).await {
+            if let Err(e) = sink.write_all(&buf[..n]).await {
                 return Outcome::failed(SessionCode::Refused, format!("写盘失败：{e}"));
             }
             received = received.saturating_add(n as u64);
         }
+        // 显式 flush：hash 校验通过前不想让数据停在页缓存里被当作已落盘。
+        if let Err(e) = sink.flush().await {
+            return Outcome::failed(SessionCode::Refused, format!("落盘失败：{e}"));
+        }
+        drop(sink);
         if let Err(e) = file.finish() {
             return Outcome::failed(SessionCode::Denied, format!("传输不完整：{e}"));
         }

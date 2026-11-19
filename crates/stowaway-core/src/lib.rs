@@ -34,6 +34,7 @@ pub mod file;
 pub mod forward;
 pub mod link_actor;
 pub mod node;
+pub mod runtime;
 pub mod service;
 pub mod session;
 pub mod session_stream;
@@ -63,6 +64,8 @@ pub use forward::{
 };
 pub use link_actor::{LINK_BATCH_BYTES, LINK_BATCH_MS, LinkActor, LinkCommand};
 pub use node::{Node, NodeConfig};
+pub use runtime::{Link, Runtime, RuntimeConfig, Side, accept, bind, dial, follow, lead, side_of};
+pub use service::{Outcome, ServiceConfig, ServiceTask, Services, relay_stream};
 pub use session::{SESSION_QUEUE_DEPTH, SessionMeta, SessionState, SessionTable};
 pub use session_stream::{SessionOutbound, SessionStream, outbound_message};
 pub use socks::{Parsed, SocksError, Target, TargetAddr};
