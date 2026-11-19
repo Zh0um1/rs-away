@@ -29,7 +29,7 @@ pub enum ClientVerify {
 impl TlsConfig {
     /// 占位客户端配置：可构造，但一旦真的用于拨号会返回 `FeatureDisabled`。
     #[must_use]
-    pub const fn client(_verify: ClientVerify, _sni: Option<String>) -> Self {
+    pub fn client(_verify: ClientVerify, _sni: Option<String>) -> Self {
         Self
     }
 
