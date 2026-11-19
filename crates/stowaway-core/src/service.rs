@@ -259,8 +259,26 @@ impl Services {
     }
 
     /// 开一条会话流；会话未登记 / 已绑定都报错。
+    ///
+    /// **调用前必须先 [`Self::confirm`]**（plan §4.14 E18）：会话在对端
+    /// 眼里是 `Opening`，只有我们回过 `SessionReady` 它才允许发数据；反过
+    /// 来，我们回 `Ok` 也必须以「出口确实建起来了」为前提，否则就是把
+    /// v1 `admin/handler/socks.go:204` 的「先回成功再拨号」搬进 v2。
     async fn stream(&self, key: SessionKey, from: NodeId) -> Result<SessionStream> {
         self.engine.open_stream(key, from).await
+    }
+
+    /// 回报会话就绪/失败（顺序见 [`Self::stream`] 的说明）。
+    async fn confirm(&self, key: SessionKey, from: NodeId, code: SessionCode, detail: &str) {
+        if let Err(e) = self
+            .engine
+            .ready_session(key, from, code, detail.to_owned())
+            .await
+        {
+            // 回不了 Ready 说明链路已经断了：记一行日志即可，调用方随后
+            // 会因为 open_stream 失败走同一失败分支。
+            tracing::warn!("回报会话 {key:?} 的 {} 失败：{e}", code_tag(code));
+        }
     }
 
     // —— 各服务 ——
@@ -283,8 +301,16 @@ impl Services {
     async fn run_connect(&self, key: SessionKey, from: NodeId, addr: String) -> Outcome {
         let local = match dial_target(&addr).await {
             Ok(s) => s,
-            Err(e) => return Outcome::failed(dial_code(&e), format!("拨号 {addr} 失败：{e}")),
+            Err(e) => {
+                let code = dial_code(&e);
+                let detail = format!("拨号 {addr} 失败：{e}");
+                self.confirm(key, from, code, &detail).await;
+                return Outcome::failed(code, detail);
+            }
         };
+        // 出口已经建起来，现在才敢对发起方说「可以发数据了」。
+        self.confirm(key, from, SessionCode::Ok, &format!("已连上 {addr}"))
+            .await;
         let mut session = match self.stream(key, from).await {
             Ok(s) => s,
             Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
@@ -305,10 +331,6 @@ impl Services {
             Ok(p) => p,
             Err(e) => return Outcome::failed(SessionCode::Denied, format!("文件名不可用：{e}")),
         };
-        let mut session = match self.stream(key, from).await {
-            Ok(s) => s,
-            Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
-        };
         // 逐块读会话流 → 写盘 → 记账，最后核对长度与摘要。
         let mut file = match crate::file::IncomingFile::new(key, &path, &param) {
             Ok(f) => f,
@@ -321,6 +343,18 @@ impl Services {
         let mut sink = match tokio::fs::File::create(&path).await {
             Ok(f) => f,
             Err(e) => return Outcome::failed(SessionCode::Refused, format!("创建文件失败：{e}")),
+        };
+        // 目标文件已经打开，才敢对发起方说「可以发数据了」（plan §4.14 E18）。
+        self.confirm(
+            key,
+            from,
+            SessionCode::Ok,
+            &format!("可写入 {}", path.display()),
+        )
+        .await;
+        let mut session = match self.stream(key, from).await {
+            Ok(s) => s,
+            Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
         };
         let mut buf = vec![0u8; crate::file::FILE_CHUNK];
         let mut received = 0u64;
@@ -361,13 +395,25 @@ impl Services {
 
     async fn run_shell(&self, key: SessionKey, from: NodeId, param: ShellParam) -> Outcome {
         let spec = crate::shell::ShellSpec::new(key, &param).with_charset(self.config.charset);
+        let mut pty = match crate::shell::spawn(&spec) {
+            Ok(p) => p,
+            Err(e) => {
+                let detail = format!("PTY 起不来：{e}");
+                self.confirm(key, from, SessionCode::Refused, &detail).await;
+                return Outcome::failed(SessionCode::Refused, detail);
+            }
+        };
+        // PTY 已经起来，才回「可以发按键了」（plan §4.14 E18）。
+        self.confirm(
+            key,
+            from,
+            SessionCode::Ok,
+            &format!("PTY {}x{}", param.cols, param.rows),
+        )
+        .await;
         let mut session = match self.stream(key, from).await {
             Ok(s) => s,
             Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
-        };
-        let mut pty = match crate::shell::spawn(&spec) {
-            Ok(p) => p,
-            Err(e) => return Outcome::failed(SessionCode::Refused, format!("PTY 起不来：{e}")),
         };
         let mut up = 0u64;
         let mut down = 0u64;
@@ -430,14 +476,26 @@ impl Services {
         if let Some(kh) = &self.config.known_hosts {
             spec = spec.with_known_hosts(kh.clone());
         }
-        let mut session = match self.stream(key, from).await {
-            Ok(s) => s,
-            Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
-        };
         if spec.is_interactive() {
             let mut shell = match crate::ssh::open_shell(&spec, None).await {
                 Ok(s) => s,
-                Err(e) => return Outcome::failed(SessionCode::Refused, format!("SSH 失败：{e}")),
+                Err(e) => {
+                    let detail = format!("SSH 失败：{e}");
+                    self.confirm(key, from, SessionCode::Refused, &detail).await;
+                    return Outcome::failed(SessionCode::Refused, detail);
+                }
+            };
+            // SSH 通道已经开出来，才回「可以发按键了」（plan §4.14 E18）。
+            self.confirm(
+                key,
+                from,
+                SessionCode::Ok,
+                &format!("SSH 交互会话就绪（{addr}）"),
+            )
+            .await;
+            let mut session = match self.stream(key, from).await {
+                Ok(s) => s,
+                Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
             };
             let mut up = 0u64;
             let mut down = 0u64;
@@ -473,16 +531,31 @@ impl Services {
             }
             return Outcome::ok(format!("SSH 交互会话结束（{addr}）"), (up, down));
         }
-        match crate::ssh::run_command(&spec, &param.command).await {
-            Ok(out) => {
-                let n = out.output.len() as u64;
-                if let Err(e) = session.write_all(&out.output).await {
-                    return Outcome::failed(SessionCode::Refused, format!("写会话失败：{e}"));
-                }
-                Outcome::ok(format!("SSH 命令退出码 {:?}", out.exit_status), (0, n))
+        let out = match crate::ssh::run_command(&spec, &param.command).await {
+            Ok(out) => out,
+            Err(e) => {
+                let detail = format!("SSH 失败：{e}");
+                self.confirm(key, from, SessionCode::Refused, &detail).await;
+                return Outcome::failed(SessionCode::Refused, detail);
             }
-            Err(e) => Outcome::failed(SessionCode::Refused, format!("SSH 失败：{e}")),
+        };
+        // 命令已经跑完拿到输出，才回「可以接结果了」（plan §4.14 E18）。
+        self.confirm(
+            key,
+            from,
+            SessionCode::Ok,
+            &format!("SSH 命令已执行（{addr}）"),
+        )
+        .await;
+        let mut session = match self.stream(key, from).await {
+            Ok(s) => s,
+            Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
+        };
+        let n = out.output.len() as u64;
+        if let Err(e) = session.write_all(&out.output).await {
+            return Outcome::failed(SessionCode::Refused, format!("写会话失败：{e}"));
         }
+        Outcome::ok(format!("SSH 命令退出码 {:?}", out.exit_status), (0, n))
     }
 
     async fn run_ssh_tunnel(
@@ -503,8 +576,20 @@ impl Services {
         };
         let (conn, channel) = match crate::ssh::open_tunnel(&spec, &host, port).await {
             Ok(v) => v,
-            Err(e) => return Outcome::failed(SessionCode::Refused, format!("SSH 隧道失败：{e}")),
+            Err(e) => {
+                let detail = format!("SSH 隧道失败：{e}");
+                self.confirm(key, from, SessionCode::Refused, &detail).await;
+                return Outcome::failed(SessionCode::Refused, detail);
+            }
         };
+        // direct-tcpip 通道已经建立，才回「可以发数据了」（plan §4.14 E18）。
+        self.confirm(
+            key,
+            from,
+            SessionCode::Ok,
+            &format!("SSH 隧道就绪 → {host}:{port}"),
+        )
+        .await;
         let mut session = match self.stream(key, from).await {
             Ok(s) => s,
             Err(e) => return Outcome::failed(SessionCode::Refused, e.to_string()),
@@ -594,6 +679,17 @@ fn ssh_tunnel_param(param: &ServiceParam) -> Result<SshTunnelParam> {
 
 fn bad_param(msg: impl Into<String>) -> CoreError {
     CoreError::Protocol(stowaway_protocol::ProtocolError::Payload(msg.into()))
+}
+
+/// `SessionCode` 的短文本（日志里用；`Debug` 会带类型前缀）。
+fn code_tag(code: SessionCode) -> &'static str {
+    match code {
+        SessionCode::Ok => "ok",
+        SessionCode::Refused => "refused",
+        SessionCode::Timeout => "timeout",
+        SessionCode::NotFound => "not-found",
+        SessionCode::Denied => "denied",
+    }
 }
 
 /// 拆 `host:port`（支持 `[::1]:22`）。
