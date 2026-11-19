@@ -18,7 +18,29 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TlsConfig;
 
+/// 客户端校验策略占位：关闭 `tls` 时只有 `Tofu`，因为 `Pin` 需要真指纹。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClientVerify {
+    /// 无 pin（关闭 TLS 时唯一可表达的形态）。
+    #[default]
+    Tofu,
+}
+
 impl TlsConfig {
+    /// 占位客户端配置：可构造，但一旦真的用于拨号会返回 `FeatureDisabled`。
+    #[must_use]
+    pub const fn client(_verify: ClientVerify, _sni: Option<String>) -> Self {
+        Self
+    }
+
+    /// 占位服务端配置：同上。
+    ///
+    /// # Errors
+    /// 恒为 `Ok`——关闭 `tls` 时不存在「装配失败」，失败发生在真正使用时。
+    pub fn server(_secret_digest: &[u8; 32], _san: &[String]) -> crate::Result<Self> {
+        Ok(Self)
+    }
+
     /// 恒为 `None`：关闭 `tls` 时没有任何指纹可advertise。
     #[must_use]
     pub const fn advertised_fingerprint(&self) -> Option<[u8; 32]> {

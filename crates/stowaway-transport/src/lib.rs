@@ -67,6 +67,8 @@ pub use link::{
 pub use sniff::{Protocol, SNIFF_LEN, classify, hex_preview};
 pub use spec::{SpecError, TransportSpec};
 #[cfg(feature = "tls")]
-pub use tls::{TlsConfig, derive_cert, parse_pin, peer_fingerprint_der, spki_fingerprint};
+pub use tls::{
+    ClientVerify, TlsConfig, derive_cert, parse_pin, peer_fingerprint_der, spki_fingerprint,
+};
 #[cfg(not(feature = "tls"))]
-pub use tls_off::TlsConfig;
+pub use tls_off::{ClientVerify, TlsConfig};
