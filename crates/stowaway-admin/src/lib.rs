@@ -10,6 +10,8 @@
 //!
 //! 本文件新增于 TUI 交付（P1），未改动 `main.rs`。
 
+/// 命令行参数（clap 派生；不依赖 ratatui）。
+pub mod cli;
 /// 命令解析（主面板 5 条 + 节点面板 20 条；不依赖 ratatui）。
 pub mod command;
 /// 命令历史（三份独立列表，不依赖 ratatui）。
