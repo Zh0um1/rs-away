@@ -536,6 +536,11 @@ pub enum SessionDirection { Outbound, Inbound }   // 相对**接收方**：Outbo
 | E14 | §5.1 raw 靠 `peek` 判 `STW2` 即可 | **前导成为线上显式约定**：拨号端 `connect` 先 `write_all(MAGIC)`，接受端判明 raw/TLS 后 `read_exact` 消费并核对 | `peek` 只取不消费，4 字节会残留进 `LinkCodec` 被当帧版本字节（`BadVersion { actual: b'S' }`）。v1 无此前导（`protocol/raw.go:26` 的 `CNegotiate()` 是空实现），属 v2 新增 |
 | E15 | §5.1#10「SSH 可配 known_hosts」 | 默认 `HostKeyPolicy::Strict`；`AcceptAndLearn` 需显式选；`Insecure` 需显式开启。比对前先 `strip_comment()` | `russh` 的 `check_known_hosts_path` 用整个 `PublicKey` 的 `PartialEq`，把 `comment` 也算进去，而 known_hosts 只存 base64——不剥注释会把「同 key 不同注释」误判成 `KeyChanged` |
 | E16 | §4.6 Service 族 | `sshtunnel` 与 `connect` 合并为 `stowaway_core::bridge`；桥接时本端扮 `NodeKind::Admin` | v1 两者共用同一套「伪 admin 握手 + 子节点登记」，唯一区别是底层通路（SSH direct-tcpip vs 裸 TCP/TLS）；`opposite(role)` 校验要求对端必须是 Agent |
+| E17 | 附录 A 第 12、21、25、39 行用到 `Listen`/`FileUpload`/`FileDownload`/`Backward` 四个服务种类 | `ServiceKind` 只追加 `Listen` 与 `Backward`；`FileUpload`/`FileDownload` **不新增**，上传与下载共用 `File`，方向由 `SessionDirection` 决定 | 上行/下行是同一种「分块 + sha256 校验」的语义，分成两个 kind 会让响应方必须写两个完全相同的分支；方向信息 `OpenSession` 里本来就有。`Listen`/`Backward` 无法复用 `Connect`——它们要 `bind` 而不是拨号 |
+| E18 | §4.9 服务层「探测通过后直接开流」 | `Services` 在**真正建立出口成功之后、开流之前**才 `ready_session(Ok)`；失败先 `ready_session(code)` 再回 `ServiceExit` | 发起方 `serve_connect` 的硬顺序是「等 Ready → 回真实 REP → pump」；出口没确认可达就回 SOCKS 成功，等于把 `admin/handler/socks.go:204` 的「先回成功再拨号」缺陷原样搬过来 |
+| E19 | §4.6 服务请求带目标地址 | `ServiceRequest` **不含** `target`；地址一律随 `OpenSession.target` 下发，服务执行器按会话键记住它 | 目标地址是会话级属性（同一条会话的所有 Probe/Run 都指向同一目标），放进每条请求会重复且可能与会话不一致 |
+| E20 | 附录 A 的 `LISTENREQ`/`BACKWARDTEST` 在 P6 只要求命令可用 | P6 交付命令解析、参数校验与 `Probe`（返回真前置条件）；**Run 阶段显式返回 `Refused` 并说明是 P7 联调项** | `listen` 与 `backward` 的执行要装配新链路（共享同一编号分配器 + 传输层监听），那是运行时职责；探测说「可以」而执行说「没做」必须让调用方看得见，不能静默成功 |
+| E21 | §4.10 控制台「两级面板 + 22 命令」 | `command.rs` 的 `parse` 与 `render.rs` 的按键/渲染与网络完全解耦：`render` 只产出 `Action::{None,Submit,Quit}`，执行在 `console.rs` | 让 TUI 可被 `TestBackend` 快照测试（53 条单测），也让 `--non-interactive` 复用同一个命令面而不必重写解析 |
 
 ---
 
