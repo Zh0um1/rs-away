@@ -125,7 +125,7 @@ async fn run_passive(args: &cli::Args, upstream: &TransportSpec, port: u16) -> a
     let mut spec = upstream.clone();
     spec.host = "0.0.0.0".to_owned();
     spec.port = port;
-    let tls = server_tls(args);
+    let tls = server_tls(args)?;
     let (mut listener, kind, addr) = stowaway_core::bind(&spec, tls.clone()).await?;
     info!(%addr, kind = ?kind, "被动监听中");
 
@@ -286,19 +286,19 @@ fn client_tls(args: &cli::Args, pin: Option<[u8; 32]>) -> Option<TlsConfig> {
 }
 
 /// 服务端 TLS（`--tls` 时启用）：证书从共享密钥派生（plan §4.7 D6）。
-fn server_tls(args: &cli::Args) -> Option<TlsConfig> {
+///
+/// # Errors
+/// `--tls` 已开启但证书装配失败。**必须拒绝启动**：静默降级成明文会让
+/// 用户以为自己在加密信道上（缺陷 #5 的反面），而 `--tls` 是显式承诺。
+fn server_tls(args: &cli::Args) -> anyhow::Result<Option<TlsConfig>> {
     if !args.tls {
-        return None;
+        return Ok(None);
     }
-    let secret = load_secret(args).ok()?;
+    let secret = load_secret(args)?;
     let san: Vec<String> = args.domain.iter().cloned().collect();
-    match TlsConfig::server(&secret.digest(), &san) {
-        Ok(cfg) => Some(cfg),
-        Err(e) => {
-            warn!(error = %e, "服务端 TLS 装配失败，改为明文");
-            None
-        }
-    }
+    let cfg = TlsConfig::server(&secret.digest(), &san)
+        .map_err(|e| anyhow::anyhow!("TLS 服务端配置失败（--tls 已开启，拒绝以明文启动）：{e}"))?;
+    Ok(Some(cfg))
 }
 
 /// 读共享密钥。长度下限按 `--allow-weak-secret` 决定（plan §5.1 / E10）。

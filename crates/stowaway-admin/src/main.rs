@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let mut alloc = NodeIdAllocator::new(salt_from_secret(&digest));
-    let server_tls = server_tls(&args, &digest);
+    let server_tls = server_tls(&args, &digest)?;
 
     // 第一条链路：主动拨出、或被动监听并接受首个入站。
     match &mode {
@@ -213,19 +213,18 @@ fn client_tls(args: &cli::Args, pin: Option<[u8; 32]>) -> Option<TlsConfig> {
 }
 
 /// 服务端 TLS 配置；`--tls` 未开时为 `None`。
-fn server_tls(args: &cli::Args, digest: &[u8; 32]) -> Option<TlsConfig> {
+///
+/// # Errors
+/// `--tls` 已开启但证书装配失败。**必须拒绝启动**：静默降级成明文等于
+/// 让用户以为自己在加密信道上（缺陷 #5 的反面），而 `--tls` 是显式承诺。
+fn server_tls(args: &cli::Args, digest: &[u8; 32]) -> anyhow::Result<Option<TlsConfig>> {
     if !args.tls {
-        return None;
+        return Ok(None);
     }
     let san = vec![args.domain.clone().unwrap_or_else(|| "stowaway".to_owned())];
-    match TlsConfig::server(digest, &san) {
-        Ok(tls) => Some(tls),
-        Err(e) => {
-            // 启动期失败即拒绝：静默降级成明文是缺陷 #5 的反面。
-            tracing::error!("TLS 服务端配置失败：{e}");
-            None
-        }
-    }
+    let tls = TlsConfig::server(digest, &san)
+        .context("TLS 服务端配置失败（--tls 已开启，拒绝以明文启动）")?;
+    Ok(Some(tls))
 }
 
 /// 非交互模式：逐条执行 `--command`，或（未给命令时）常驻服务。
