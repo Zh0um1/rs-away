@@ -25,6 +25,7 @@ fn main() -> ExitCode {
         "test" => test(),
         "doccheck" => run_doccheck(),
         "no-panic" => run_no_panic(),
+        "no-unsafe" => run_no_unsafe(),
         "build-matrix" => run_build_matrix(&args[1..]),
         "help" | "-h" | "--help" => {
             print_help();
@@ -46,6 +47,7 @@ fn print_help() {
   test        cargo test --workspace --all-features
   doccheck    校验 docs/**.md 内所有 `path/to/file.go:LINE` 引用有效
   no-panic    校验 crates/*/src 的非测试代码里没有 panic 类构造
+  no-unsafe   校验 protocol/crypto/transport 三 crate 的 unsafe 计数为 0（§8.6 第六条）
   build-matrix 按 plan.md §4.13 的 11 个 blocking 组合交叉编译出包（`cargo xtask build-matrix --help`）
   help        显示本帮助"#
     );
@@ -77,6 +79,11 @@ fn run_check() -> ExitCode {
     eprintln!("==> no-panic");
     if run_no_panic() != ExitCode::SUCCESS {
         eprintln!("xtask check: no-panic 失败");
+        return ExitCode::FAILURE;
+    }
+    eprintln!("==> no-unsafe");
+    if run_no_unsafe() != ExitCode::SUCCESS {
+        eprintln!("xtask check: no-unsafe 失败");
         return ExitCode::FAILURE;
     }
     eprintln!("xtask check: 全部通过");
@@ -189,6 +196,107 @@ fn run_no_panic() -> ExitCode {
         ExitCode::FAILURE
     }
 }
+
+/// `no-unsafe`：plan.md §8.6 第六条 DoD（原口径 `cargo geiger`）的等价实现。
+///
+/// `cargo-geiger` 无法在本仓库环境安装（离线缓存里没有该 crate，联网安装也失败），
+/// 因此改为自建扫描器：对每个 crate 的 `src/` 逐行统计**真正构成 unsafe 作用域**的
+/// 构造 —— `unsafe {`、`unsafe fn`、`unsafe impl`、`unsafe trait`、`extern "C"`。
+///
+/// 与 `no-panic` 的两点差异，都是**有意**的：
+/// 1. 扫**全部**行，遇到 `#[cfg(test)]` 不提前退出 —— `unsafe` 不能用「在测试里」豁免，
+///    测试代码里的 unsafe 同样进产物；
+/// 2. 注释里提到 unsafe（例如 `// 本 crate 禁 unsafe`）不算命中，因为判据是「去掉注释
+///    与文档后还剩什么」：行首或空白之后紧跟 `//`、`///`、`//!` 的行直接跳过。
+///
+/// `#![forbid(unsafe_code)]` / `unsafe_op_in_unsafe_fn` 是**禁用声明**，不是使用，
+/// 出现它们本身应被跳过（否则每个 crate 都会永远报 1 处）。
+fn run_no_unsafe() -> ExitCode {
+    let root = repo_root();
+    // plan.md §8.6：protocol / crypto / transport 三个 crate 的 unsafe 计数必须为 0。
+    // core 及以上允许出现平台相关 unsafe（目前也确为 0），单独统计但不作为门禁。
+    const GATED: [&str; 3] = ["protocol", "crypto", "transport"];
+    const REPORTED: [&str; 3] = ["core", "admin", "agent"];
+    let mut total_files = 0usize;
+    let mut gated_violations = 0usize;
+    let mut reported_violations = 0usize;
+    for name in GATED.into_iter().chain(REPORTED) {
+        let src = root
+            .join("crates")
+            .join(format!("stowaway-{name}"))
+            .join("src");
+        let mut files = Vec::new();
+        collect_rs(&src, &mut files);
+        files.sort();
+        total_files += files.len();
+        let gated = GATED.contains(&name);
+        let mut count = 0usize;
+        for file in &files {
+            let text = match std::fs::read_to_string(file) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("no-unsafe: 读取 {} 失败：{e}", file.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            for (idx, line) in text.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // 注释与文档不构成 unsafe 作用域。
+                if trimmed.starts_with("//")
+                    || trimmed.starts_with("/*")
+                    || trimmed.starts_with('*')
+                {
+                    continue;
+                }
+                // `#![forbid(unsafe_code)]` 之类是禁用声明，不是使用。
+                if trimmed.contains("forbid(unsafe_code)")
+                    || trimmed.contains("deny(unsafe_op_in_unsafe_fn")
+                    || trimmed.contains("unsafe_op_in_unsafe_fn")
+                {
+                    continue;
+                }
+                if UNSAFE_FORMS.iter().any(|p| trimmed.contains(p)) {
+                    let rel = file.strip_prefix(&root).unwrap_or(file);
+                    println!("NO-UNSAFE     {}:{}  {}", rel.display(), idx + 1, trimmed);
+                    count += 1;
+                }
+            }
+        }
+        if gated {
+            gated_violations += count;
+        } else {
+            reported_violations += count;
+        }
+        println!(
+            "no-unsafe: stowaway-{name}: {count} 处{}",
+            if gated {
+                "（门禁）"
+            } else {
+                "（仅统计）"
+            }
+        );
+    }
+    if gated_violations == 0 {
+        println!(
+            "no-unsafe: {total_files} 个源文件，受门禁的三个 crate 0 处 unsafe（其余 crate 共 {reported_violations} 处）"
+        );
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "no-unsafe: 受门禁的 crate 有 {gated_violations} 处 unsafe（plan.md §8.6 要求为 0）"
+        );
+        ExitCode::FAILURE
+    }
+}
+
+/// 真正构成 unsafe 作用域的语法形态（不含注释里提到的 `unsafe`）。
+const UNSAFE_FORMS: [&str; 5] = [
+    "unsafe {",
+    "unsafe fn ",
+    "unsafe impl",
+    "unsafe trait",
+    "extern \"C\"",
+];
 
 fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
