@@ -25,6 +25,7 @@
 
 pub mod alloc;
 pub mod backward;
+pub mod bootstrap;
 pub mod bridge;
 pub mod dispatch;
 pub mod engine;
@@ -43,11 +44,17 @@ pub mod topology;
 pub mod udp_relay;
 pub mod upstream_proxy;
 
+pub use alloc::{NODE_ID_MAGIC, NodeIdAllocator, salt_from_secret};
 pub use backward::{
     BACKWARD_PROBE_TIMEOUT, BackwardListener, BackwardSpec, dial_remote, next_open, open_message,
     relay_backward,
 };
+pub use bootstrap::{assign_id, request_id};
 pub use dispatch::{Route, decide, undeliverable_status};
+pub use engine::{
+    Command, ENGINE_QUEUE_DEPTH, Engine, EngineHandle, Event, HeartbeatConfig, LinkStat, NodeInfo,
+    SharedHandle, Snapshot, now_ms,
+};
 pub use error::{CoreError, Result};
 pub use file::{FILE_CHUNK, FileError, IncomingFile, safe_join, validate_name};
 pub use forward::{
