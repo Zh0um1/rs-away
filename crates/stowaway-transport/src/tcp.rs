@@ -8,8 +8,21 @@
 //! accept → peek(8)，**不消费**
 //!   ├─ 首字节 0x16 且本端配了 TLS → 包 TLS，握手*后*再消费前导
 //!   ├─ 前缀 == "STW2"           → 明文 raw，随即消费掉这 4 字节前导
-//!   └─ 其它                      → ReuseFallback（交调用方做端口复用回落/关闭）
+//!   ├─ "GET " / "POST " / ...   → ws 走错端口，报 UnrecognizedPeer（**不走回落**）
+//!   └─ 其它（Foreign）           → 配了回落目标就原样转走并继续 accept；
+//!                                  没配则 ReuseFallback（交调用方决定转发/关闭）
 //! ```
+//!
+//! # 端口复用回落
+//!
+//! 对应 v1 `agent/initial/method.go` 的 `ProxyStream` / `CopyTraffic`。v1 的
+//! 做法是「读出若干字节 → 拨号 → 把已读字节补写过去 → 双向对拷」；v2 换成
+//! `MSG_PEEK` 嗅探后**根本不需要补写**：判定所读的字节从未被消费，整条流
+//! 仍然完整地躺在内核接收缓冲里。因此回落只是「拨号 + `copy_bidirectional`」，
+//! 不会出现 v1 那种「补写顺序与并发读交错」的竞态。
+//!
+//! 回落是**旁路**：`accept` 把该连接交给单独的 `tokio::spawn` 任务后立刻回到
+//! 监听循环，回落的成功率/时延都不影响本协议链路的接入速度。
 //!
 //! **前导是线上约定，不是嗅探副产物**：`peek` 只取不消费，所以拨号端必须先显式
 //! `write_all(MAGIC)`，接受端在判明 `Raw`/`Tls` 后显式 `read_exact` 把它吃掉，
@@ -32,6 +45,21 @@ use crate::link::{DialTarget, Dialer, Link, LinkMeta, Listener};
 /// 选 300ms：真实客户端的 `Hello` 是一帧、必然一次 write 出去；
 /// 若对端是 HTTP 客户端，它也在等我们响应，两边都不能无限等。
 const PEEK_TIMEOUT_MS: u64 = 300;
+
+/// 端口复用回落时双向对拷的缓冲区大小（10 KiB）。
+///
+/// 与 v1 `agent/initial/method.go` 的 `CopyTraffic` 保持一致：v1 用
+/// `make([]byte, 10240)` 固定分配，不随流量增长。v2 同样用固定大小，
+/// 让每条回落连接的常驻内存可预测（回落连接数不受本协议控制，
+/// 若按吞吐动态放大缓冲区，一条慢速大流量旁路就能吃掉整台机器的内存）。
+pub const FALLBACK_BUF: usize = 10 * 1024;
+
+/// 回落拨号超时：目标端口可能已关闭或正在排队，`accept` 不能因此挂住。
+///
+/// 10s 与 v1 的 `net.Dial` 依赖内核 SYN 重试（约 1s/2s/4s/8s）量级相当，
+/// 但显式给上限——内核默认可能重试到 2 分钟以上，那会让回落任务长时间
+/// 占着一条已建立的入向连接。
+const FALLBACK_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 明文 TCP 链路。
 ///
@@ -111,10 +139,15 @@ pub struct RawListener {
     tls: Option<crate::TlsConfig>,
     nodelay: bool,
     keepalive: Option<Duration>,
+    fallback: Option<SocketAddr>,
 }
 
 impl RawListener {
     /// 绑定并监听。
+    ///
+    /// 默认**没有**回落目标：端口复用的目标是要么由上层策略决定、要么由
+    /// iptables 规则决定，不该藏在 `bind` 的入参里。这也保证既有调用点
+    /// （`crate::codec::listener_for` 等）零改动。
     ///
     /// # Errors
     /// 端口被占用、权限不足等返回 [`TransportError::Io`]。
@@ -130,7 +163,28 @@ impl RawListener {
             tls,
             nodelay,
             keepalive,
+            fallback: None,
         })
+    }
+
+    /// 设置端口复用回落目标（链式构造）。
+    ///
+    /// `Some(addr)`：判定为非本协议流量时，把整条流原样转给 `addr`，并继续
+    /// 接受下一个连接；`None`：恢复「返回 [`TransportError::ReuseFallback`]
+    /// 由调用方决定」的既有语义。
+    ///
+    /// 用 `const fn` + `mut self` 而非 `&mut self`：监听器在 `Listener::accept`
+    /// 之外不该被可变借用，链式写法也让 `bind(...).with_fallback(..)` 可读。
+    #[must_use]
+    pub const fn with_fallback(mut self, target: Option<SocketAddr>) -> Self {
+        self.fallback = target;
+        self
+    }
+
+    /// 当前回落目标。
+    #[must_use]
+    pub const fn fallback(&self) -> Option<SocketAddr> {
+        self.fallback
     }
 
     /// 本端是否启用 TLS。
@@ -146,13 +200,22 @@ impl Listener for RawListener {
     }
 
     async fn accept(&mut self) -> io::Result<(Box<dyn Link>, SocketAddr)> {
-        {
+        // 循环只为「回落成功」这一个理由而存在：一条陌生连接被转走后，
+        // 本监听器应当继续为上层的下一条本协议连接服务，而不是把它自己
+        // 变成一个「一次只处理一条连接」的串行转发器。
+        //
+        // 其余分支（TLS 握手、前导、ws、无回落时的 ReuseFallback）都原样
+        // `return`，所以循环不会改变任何既有的错误时序与语义。
+        loop {
             let (stream, peer) = self.listener.accept().await?;
             apply_sockopts(&stream, self.nodelay, self.keepalive)?;
 
             // peek(8)：只取不消费，避免与后续 TLS/协议解析抢字节。
             // 循环累计：单次 peek 可能只返回 1 字节（TCP 分段），
             // 而 `MAGIC` 需要 4 字节才能判定。超时视为非本协议流量。
+            //
+            // 「不消费」也是端口复用回落能「整条流原样转走」的前提：
+            // 判为陌生流量时这 n 个字节仍在 socket 里，回落方直接对拷即可。
             let mut probe = [0u8; 8];
             let mut n = 0usize;
             let deadline = Duration::from_millis(PEEK_TIMEOUT_MS);
@@ -222,18 +285,103 @@ impl Listener for RawListener {
                 // ws 由独立端口/监听器处理；同端口共存时这里明确报错而不是猜测。
                 // 用 `UnrecognizedPeer`（kind = InvalidData）而不是 `invalid_input`：
                 // 对上游 PEMBE 来说这是「对端协议不符」，与端口复用回落同类可重试错误。
+                //
+                // 即便配了回落目标，ws 也**不**走回落：它是已知协议、只是接到了
+                // 错的端口，转给后端只会得到一份 400，不如立刻把误配暴露出来。
                 return Err(to_io(&TransportError::UnrecognizedPeer {
                     peeked: n,
                     hex: hex_preview(peeked),
                 }));
             }
 
-            Err(to_io(&TransportError::ReuseFallback {
-                peeked: n,
-                hex: hex_preview(peeked),
-            }))
+            // —— Foreign：非本协议流量 ——
+            let Some(target) = self.fallback else {
+                // 没有回落目标：保持既有契约（调用方自己决定转发还是关闭）。
+                return Err(to_io(&TransportError::ReuseFallback {
+                    peeked: n,
+                    hex: hex_preview(peeked),
+                }));
+            };
+
+            // 有回落目标：把这条流交给旁路任务后立刻回去接下一个连接。
+            // 不在这里 `await` 对拷——回落连接的存活时间由外部流量决定，
+            // 若内联等待，一条长连接 SSH 会话就能让本监听器停止接入本协议流量。
+            let hex = hex_preview(peeked);
+            tokio::spawn(async move {
+                // 任务返回值只留在后台：错误必须落日志，否则回落失败会表现为
+                // 「客户端莫名其妙被断连」而服务端一声不吭，线上极难定位。
+                match proxy_to_fallback(stream, target).await {
+                    Ok(up) => {
+                        tracing::debug!(%target, %peer, up, %hex, "端口复用回落结束");
+                    }
+                    Err(e) => {
+                        tracing::debug!(%target, %peer, error = %e, %hex, "端口复用回落失败");
+                    }
+                }
+            });
         }
     }
+}
+
+/// 把一条**尚含未消费前导字节**的入向连接原样转交给回落目标。
+///
+/// 对应 v1 `agent/initial/method.go` 的 `ProxyStream`：拨号 → 双向对拷。
+///
+/// # 前提（改动者必读）
+///
+/// 本函数**假定 `stream` 里一个字节都还没被消费**。`tcp.rs` 的嗅探用的是
+/// `TcpStream::peek`（`MSG_PEEK`），它只把数据复制出来看，不推进接收队列，
+/// 所以判为 `Foreign` 时那几个字节（最多 8 个）仍完整留在流里，直接对拷即可。
+///
+/// **如果把嗅探改成 `read`，这里必须先把读出来的字节补写给 `target`**，
+/// 否则客户端请求行/SSH 横幅的前几个字节会被静默吞掉，表现为「后端收到
+/// 半截请求」——v1 正是因为先 `io.ReadFull` 才不得不手动 `reuseConn.Write(message)`。
+///
+/// 不在此处做任何协议解析：回落目标可能是任意协议（SSH/HTTP/MySQL…）。
+///
+/// # 返回值
+/// 上行（客户端 → 目标）字节数，即 `copy_bidirectional` 的 `a→b` 计数。
+/// 下行字节数不回传：调用方只据此判断「有没有真的转过去」。
+///
+/// # Errors
+/// - 拨号超过 10 秒 → [`io::ErrorKind::TimedOut`]（文案带目标地址）；
+/// - 拨号被拒绝/不可达 → 对应 [`io::ErrorKind`]；
+/// - 对拷中途失败 → 底层错误。对拷阶段的部分字节可能已送出，
+///   这是 TCP 旁路的固有性质（与 v1 一致），不做补偿。
+pub async fn proxy_to_fallback(stream: TcpStream, target: SocketAddr) -> io::Result<u64> {
+    let dial = TcpStream::connect(target);
+    let mut upstream = match tokio::time::timeout(FALLBACK_DIAL_TIMEOUT, dial).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e),
+        // 超时文案要具体：只说「超时」无法区分「后端没起」与「iptables 把包吃了」。
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "端口复用回落：拨号 {target} 超时（{} 秒）",
+                    FALLBACK_DIAL_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+    };
+    // 回落链路是逐条交互型流量（SSH/HTTP），Nagle 只会增加往返延迟；
+    // 失败也无所谓（设置了只影响时延），因此 `ok()` 而非传播错误。
+    upstream.set_nodelay(true).ok();
+
+    let mut inbound = stream;
+    // `copy_bidirectional_with_sizes` 才是带缓冲区大小的版本；裸
+    // `copy_bidirectional` 固定 8 KiB，与 v1 的 10 KiB 不一致。
+    // 若未来 tokio 移除了这个 API，等价写法是两个 `tokio::io::copy` 任务
+    // （`copy` 不接受缓冲大小参数，只能用 tokio 内部默认值，届时
+    // `FALLBACK_BUF` 会退化为「无用文档常量」，需要在 doc 里注明差异）。
+    let (up, _down) = tokio::io::copy_bidirectional_with_sizes(
+        &mut inbound,
+        &mut upstream,
+        FALLBACK_BUF,
+        FALLBACK_BUF,
+    )
+    .await?;
+    Ok(up)
 }
 
 /// TCP 拨号器。
