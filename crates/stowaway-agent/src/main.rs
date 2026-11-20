@@ -7,13 +7,16 @@
 mod cli;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use clap::Parser;
 use stowaway_core::{
-    Event, HeartbeatConfig, NodeConfig, Runtime, RuntimeConfig, ServiceConfig, Services,
+    Event, HeartbeatConfig, ListenContext, NodeConfig, Runtime, RuntimeConfig, ServiceConfig,
+    Services,
 };
+use stowaway_core::{NodeIdAllocator, salt_from_secret};
 use stowaway_crypto::{CertFingerprint, KEY_LEN, Secret};
-use stowaway_protocol::{NodeId, NodeKind, SessionKey, TransportKind};
+use stowaway_protocol::{JoinAck, NodeId, NodeKind, SessionKey, TransportKind};
 use stowaway_transport::{ClientVerify, DialTarget, TlsConfig, TransportSpec};
 use tracing::{info, warn};
 
@@ -115,7 +118,7 @@ async fn run_active(
         depth = ack.depth,
         "已入网"
     );
-    serve(runtime, args).await
+    serve(runtime, args, &ack).await
 }
 
 /// 被动模式：监听端口，等 admin 拨入（v1 的 `NORMAL_PASSIVE`）。
@@ -161,12 +164,13 @@ async fn run_passive(args: &cli::Args, upstream: &TransportSpec, port: u16) -> a
         )
         .await?;
         info!(me = ?ack.node, depth = ack.depth, "已入网");
-        return serve(runtime, args).await;
+        return serve(runtime, args, &ack).await;
     }
 }
 
 /// 事件循环：把引擎事件翻译成服务执行。
-async fn serve(runtime: Runtime, args: &cli::Args) -> anyhow::Result<()> {
+async fn serve(runtime: Runtime, args: &cli::Args, ack: &JoinAck) -> anyhow::Result<()> {
+    let listen_ctx = listen_context(args, ack)?;
     let handle = runtime.handle();
     let service_config = service_config(args);
     // `ServiceRequest` 不带目标地址（地址在 `OpenSession.target` 里随开会话下发），
@@ -186,8 +190,11 @@ async fn serve(runtime: Runtime, args: &cli::Args) -> anyhow::Result<()> {
             }
             Event::ServiceRequest { req, from } => {
                 let target = targets.get(&req.key).cloned().flatten();
-                let services =
+                let mut services =
                     Services::new(service_config.clone(), handle.clone()).with_target(target);
+                if let Some(ctx) = listen_ctx.clone() {
+                    services = services.with_listen_context_shared(ctx);
+                }
                 match services.handle(req, from).await {
                     Ok(Some(task)) => tasks.push(task),
                     Ok(None) => {}
@@ -261,6 +268,23 @@ fn runtime_config(args: &cli::Args, secret: &Secret) -> anyhow::Result<RuntimeCo
 }
 
 /// 服务配置：下载目录、shell 编解码、SSH host key 策略。
+/// `listen` 服务要用的上下文：新建链路的监听规格、编号分配器、本端在树里的位置。
+///
+/// 被控端替别人起监听时**由本端扮父节点**（v1 `agent/handler/listen.go` 的
+/// `normalListen` 就是发伪 admin 的 `HI`），所以这里必须带上 `me`/`root`/
+/// `depth` 与分配器；上游编号取 `JoinAck.parent`，好让新子节点被上游看见
+/// （缺了它，admin 看不到孙节点，见 plan §4.14 E6）。
+fn listen_context(args: &cli::Args, ack: &JoinAck) -> anyhow::Result<Option<Arc<ListenContext>>> {
+    // `--down` 决定 listen 用什么传输：没有显式 `--down` 就沿用上行。
+    let spec = args.downstream_spec()?;
+    let secret = Arc::new(load_secret(args)?);
+    let alloc = NodeIdAllocator::new(salt_from_secret(&secret.digest()));
+    Ok(Some(Arc::new(
+        ListenContext::new(secret.clone(), spec, alloc, ack.node, ack.root, ack.depth)
+            .with_upstream(Some(ack.parent)),
+    )))
+}
+
 fn service_config(args: &cli::Args) -> ServiceConfig {
     ServiceConfig {
         download_dir: args.download_dir.as_ref().map_or_else(

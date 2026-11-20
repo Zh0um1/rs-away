@@ -235,6 +235,14 @@ impl Services {
         self
     }
 
+    /// 同上，但复用已有的 `Arc`（事件循环里每条 `ServiceRequest` 都要用同一个
+    /// 分配器，重复 `Arc::new` 会让每个服务拿到一份各自推进的编号序列）。
+    #[must_use]
+    pub fn with_listen_context_shared(mut self, ctx: Arc<ListenContext>) -> Self {
+        self.listen = Some(ctx);
+        self
+    }
+
     /// 带上会话目标（SSH 的 `host:port`、connect 的地址都在这）。
     #[must_use]
     pub fn with_target(mut self, target: Option<String>) -> Self {
@@ -313,6 +321,15 @@ impl Services {
             // bind 一个传输层端口把拨入者接成子节点，`backward` 在本机 bind
             // 一个 TCP 监听口并逐连接向发起方要一条会话。
             (ServicePhase::Run, ServiceKind::Listen) => {
+                // 监听地址随 `ServiceParam::Connect(addr)` 下发（Service 族没有
+                // 通用的「地址」变体，连接类参数是唯一的地址载体）；空或缺省时
+                // 用 `ListenContext.spec` 里的地址。
+                let override_addr = match &req.param {
+                    ServiceParam::Connect(ConnectParam { addr }) if !addr.trim().is_empty() => {
+                        Some(addr.clone())
+                    }
+                    _ => None,
+                };
                 let Some(ctx) = self.listen.clone() else {
                     let detail =
                         "本进程没有装配监听上下文（listen 需要传输层与编号分配器）".to_owned();
@@ -324,7 +341,11 @@ impl Services {
                     req.key,
                     from,
                     ServiceKind::Listen,
-                    move |s| Box::pin(async move { s.run_listen(req.key, from, ctx).await }),
+                    move |s| {
+                        Box::pin(
+                            async move { s.run_listen(req.key, from, ctx, override_addr).await },
+                        )
+                    },
                 )))
             }
             (ServicePhase::Run, ServiceKind::Backward) => {
@@ -437,17 +458,34 @@ impl Services {
     /// 编号只能由父节点分配，所以这里必然走 [`crate::bootstrap::assign_id`]；
     /// 接入成功后向上游补一条 `Join{node: <child>}` 代子公告，否则上游不知道
     /// 多了一个孙节点（plan §4.7）。
-    async fn run_listen(&self, key: SessionKey, from: NodeId, ctx: Arc<ListenContext>) -> Outcome {
-        let _ = from;
-        let (mut listener, kind, addr) =
-            match crate::runtime::bind(&ctx.spec, ctx.tls.clone()).await {
-                Ok(v) => v,
+    async fn run_listen(
+        &self,
+        key: SessionKey,
+        from: NodeId,
+        ctx: Arc<ListenContext>,
+        override_addr: Option<String>,
+    ) -> Outcome {
+        let mut spec = ctx.spec.clone();
+        if let Some(raw) = override_addr {
+            let addr = match parse_listen_addr(&raw) {
+                Ok(a) => a,
                 Err(e) => {
-                    let detail = format!("{} 监听失败：{e}", ctx.spec);
+                    let detail = e.to_string();
                     self.reply(key, from, SessionCode::Denied, &detail).await;
                     return Outcome::failed(SessionCode::Denied, detail);
                 }
             };
+            spec.host = addr.ip().to_string();
+            spec.port = addr.port();
+        }
+        let (mut listener, kind, addr) = match crate::runtime::bind(&spec, ctx.tls.clone()).await {
+            Ok(v) => v,
+            Err(e) => {
+                let detail = format!("{spec} 监听失败：{e}");
+                self.reply(key, from, SessionCode::Denied, &detail).await;
+                return Outcome::failed(SessionCode::Denied, detail);
+            }
+        };
         self.reply(
             key,
             from,

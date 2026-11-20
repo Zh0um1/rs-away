@@ -73,7 +73,9 @@ pub use reuse::{
     decide_fallback, install, platform_supported, probe as probe_reuse, uninstall,
 };
 pub use runtime::{Link, Runtime, RuntimeConfig, Side, accept, bind, dial, follow, lead, side_of};
-pub use service::{Outcome, ServiceConfig, ServiceTask, Services, relay_stream};
+pub use service::{
+    ListenContext, Outcome, ServiceConfig, ServiceTask, Services, backward_port, relay_stream,
+};
 pub use session::{SESSION_QUEUE_DEPTH, SessionMeta, SessionState, SessionTable};
 pub use session_stream::{SessionOutbound, SessionStream, outbound_message};
 pub use socks::{Parsed, SocksError, Target, TargetAddr};

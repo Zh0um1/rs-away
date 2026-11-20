@@ -128,8 +128,9 @@ struct Running {
     socks: HashMap<u16, JoinHandle<()>>,
     /// `forward` 起的监听（按本地端口索引）。
     forwards: HashMap<u16, JoinHandle<()>>,
-    /// `backward` 起的监听（按本地端口索引）。
-    backwards: HashMap<u16, JoinHandle<()>>,
+    /// `backward` 的远端监听（按**远端**端口索引）：每条 accept 出来的
+    /// 连接一个中继任务，停一条映射就 abort 这一组。
+    backwards: HashMap<u16, Vec<JoinHandle<()>>>,
 }
 
 impl Running {
@@ -160,6 +161,14 @@ pub struct Console {
     panel: Panel,
     /// 在跑的本地监听。
     running: Running,
+    /// 反向映射登记表：`(请求时的会话键, 远端端口, 本端拨号目标)`。
+    ///
+    /// 后台任务不能碰事件流（[`Console`] 是唯一消费者），所以入站
+    /// `OpenSession{Backward, Inbound}` 必须由本层的 [`Self::drain_events`]
+    /// 就地转交。对端为每条 accept 出来的连接分配的键是
+    /// `SessionKey::new(请求键.origin, 请求键.id + n)`，所以按「同 origin 且
+    /// 请求键 id 不大于入站键 id 的最近一条」就能唯一确定属于哪条映射。
+    backwards: Vec<(SessionKey, u16, String)>,
 }
 
 impl fmt::Debug for Console {
@@ -197,6 +206,7 @@ impl Console {
             focus: None,
             panel: Panel::Main,
             running: Running::default(),
+            backwards: Vec::new(),
         }
     }
 
@@ -243,7 +253,7 @@ impl Console {
     fn drain_events(&mut self) -> Vec<String> {
         let mut notes = Vec::new();
         while let Ok(ev) = self.events.try_recv() {
-            if let Some(note) = event_note(&ev) {
+            if let Some(note) = self.route_event(&ev) {
                 notes.push(note);
             }
         }
@@ -258,6 +268,48 @@ impl Console {
     pub fn tick(&mut self) -> Option<Vec<String>> {
         let notes = self.drain_events();
         if notes.is_empty() { None } else { Some(notes) }
+    }
+
+    /// 把一条事件转成提示行；需要本端动手的（反向映射入站会话）先动手。
+    ///
+    /// `OpenSession{Backward, Inbound}` 不能像其它事件那样只打一行了事：
+    /// 对端已经 bind 好远端端口并接受了连进来的客户端，正在等本端拨本地
+    /// 目标。本端不接，对端那条连接就永远挂在 `await_ready` 上。
+    fn route_event(&mut self, ev: &Event) -> Option<String> {
+        if let Event::SessionOpened { open, .. } = ev
+            && open.kind == SessionKind::Backward
+            && open.direction == SessionDirection::Inbound
+        {
+            return Some(self.spawn_backward_relay(open.key));
+        }
+        event_note(ev)
+    }
+
+    /// 为一条反向映射的入站会话起中继任务。
+    ///
+    /// 返回需要显示的一行。找不到对应映射时不中继——宁可让那条连接
+    /// 超时关闭，也不猜一个本地端口把数据灌进去。
+    fn spawn_backward_relay(&mut self, key: SessionKey) -> String {
+        let target = self
+            .backwards
+            .iter()
+            .filter(|(base, _, _)| base.origin == key.origin && base.id <= key.id)
+            .max_by_key(|(base, _, _)| base.id)
+            .map(|(_, port, target)| (*port, target.clone()));
+        let Some((port, target)) = target else {
+            return format!(
+                "警告：收到反向映射会话 {}（{}），但本端没有登记远端端口",
+                key.id,
+                key.origin.short()
+            );
+        };
+        let handle = self.handle.clone();
+        let dial_to = target.clone();
+        let task = tokio::spawn(async move {
+            relay_backward_session(handle, key, dial_to).await;
+        });
+        self.running.backwards.entry(port).or_default().push(task);
+        format!("反向映射：远端 {port} 的会话 {} 已拨 {target}", key.id)
     }
 
     /// 等到一个满足 `want` 的引擎事件，或超时。
@@ -871,36 +923,107 @@ impl Console {
 
     // —————————————————————————————————————————————— 本地监听：backward
 
-    /// `backward <rport> <lport>`：agent 侧端口回流到 admin 本地端口。
+    /// `backward <rport> <lport>`：agent 侧监听 `rport`，admin 侧拨 `lport`。
     ///
-    /// 探测用 `BackwardSpec::probe`（参数是**监听端口**），通过后本端只
-    /// 登记意图：真正的「被监听侧 bind」在 agent 上，属 P7 联调项
-    /// （plan §4.14 E20）。
+    /// v1 语义（`admin/handler/backward.go:129` 是 `DialTimeout(LPort)`、
+    /// `agent/handler/backward.go:187` 是 `net.Listen("tcp", "0.0.0.0:"+RPort)`）：
+    /// **被监听的一侧是 agent 的 `rport`，拨号的一侧是 admin 的 `lport`**。
+    /// 命令名里的 remote/local 说的是「谁的端口在哪一边」，不是「谁监听」。
+    ///
+    /// 顺序（plan §4.14 E20 的 P7 收尾）：Probe（问对端能否监听 `rport`）→
+    /// Run（让对端真的 bind）→ 等 `ServiceReply` 拿到实际监听地址 → 登记
+    /// `running.backwards`，由后台任务承接对端发来的 `OpenSession{Backward,
+    /// Inbound}` 并逐条拨本地 `lport` 中继。
     async fn backward(&mut self, remote_port: u16, local_port: u16) -> Outcome {
+        if self.running.backwards.contains_key(&remote_port) {
+            return Outcome::fail(format!(
+                "远端端口 {remote_port} 上已有 backward 在跑（先 stopbackward）"
+            ));
+        }
         let key = self.next_key();
         let spec = stowaway_core::backward::BackwardSpec::new(
             key,
-            local_port,
-            format!("127.0.0.1:{remote_port}"),
+            remote_port,
+            format!("127.0.0.1:{local_port}"),
         );
         let (probed, mut notes) = self.probe_service(spec.probe(), key, "backward").await;
-        match probed {
-            Ok(_) => notes.push(format!(
-                "backward 探测通过（远端 {remote_port} ↔ 本地 {local_port}）；执行侧尚未接通，见 plan §4.14 E20"
+        if let Err(e) = probed {
+            notes.push(format!(
+                "错误：backward 探测失败（远端 {remote_port}）：{e}"
+            ));
+            return Outcome::lines(notes);
+        }
+        // 探测通过之后再发 Run：真正的监听在对端，本端只是发起请求。
+        let peer = self.target();
+        if let Err(e) = self.handle.send(spec.run(), peer).await {
+            notes.push(format!("错误：backward 请求未发出：{e}"));
+            return Outcome::lines(notes);
+        }
+        let (ev, more) = self
+            .wait_event("backward", REPLY_TIMEOUT, |ev| {
+                matches!(ev, Event::ServiceReply { reply, .. } if reply.key == key)
+                    || matches!(ev, Event::ServiceExit { exit, .. } if exit.key == key)
+            })
+            .await;
+        notes.extend(more);
+        match ev {
+            Some(Event::ServiceReply { reply, .. }) if reply.code == SessionCode::Ok => {
+                notes.push(format!(
+                    "backward 已就绪：远端 {remote_port} → 本地 {local_port}（{}）",
+                    reply.detail
+                ));
+                // 只登记意图：对端已 bind，本端等它发来的
+                // `OpenSession{Backward, Inbound}`（由 `route_event` 转交）。
+                self.running.backwards.entry(remote_port).or_default();
+                self.backwards
+                    .push((key, remote_port, spec.remote_target.clone()));
+            }
+            Some(Event::ServiceReply { reply, .. }) => notes.push(format!(
+                "错误：backward 未就绪：{:?}（{}）",
+                reply.code, reply.detail
             )),
-            Err(e) => notes.push(format!("错误：backward 探测失败：{e}")),
+            Some(Event::ServiceExit { exit, .. }) => notes.push(format!(
+                "错误：backward 结束：{:?}（{}）",
+                exit.code, exit.detail
+            )),
+            _ => notes.push("提示：未收到 backward 应答，请求可能仍在远端排队".to_owned()),
         }
         Outcome::lines(notes)
     }
 
     /// `stopbackward [idx]`：停回流。
+    ///
+    /// 远端端口停不掉（监听在对端），本端能做的是**不再拨号中继**：
+    /// 摘掉登记项并 abort 这组任务。对端那条监听会在下一次 accept 时因为
+    /// 等不到 `SessionReady` 而关掉该连接。
     fn stop_backward(&mut self, idx: Option<u32>) -> Outcome {
-        stop_listener(
-            &mut self.running.backwards,
-            idx,
-            "backward",
-            &mut self.events,
-        )
+        let mut lines = self.drain_events();
+        if self.running.backwards.is_empty() {
+            lines.push("没有在跑的 backward 服务（backward 停止命令无事可做）".to_owned());
+            return Outcome::lines(lines);
+        }
+        let mut ports: Vec<u16> = self.running.backwards.keys().copied().collect();
+        ports.sort_unstable();
+        let chosen: Vec<u16> = match idx {
+            None => ports,
+            Some(i) => match ports.get(usize::try_from(i).unwrap_or(usize::MAX)).copied() {
+                Some(port) => vec![port],
+                None => {
+                    lines.push(format!("没有第 {i} 条 backward（当前 {} 条）", ports.len()));
+                    return Outcome::lines(lines);
+                }
+            },
+        };
+        for port in chosen {
+            if let Some(tasks) = self.running.backwards.remove(&port) {
+                for task in tasks {
+                    task.abort();
+                }
+            }
+            self.backwards.retain(|(_, p, _)| *p != port);
+            lines.push(format!("已停止 backward（远端端口 {port}）"));
+        }
+        Outcome::lines(lines)
     }
 
     // —————————————————————————————————————————————— 文件
@@ -1184,15 +1307,27 @@ impl Console {
     // —————————————————————————————————————————————— 其它
 
     /// `listen [ip:]<port>`：在 agent 上被动监听（P7 联调项）。
+    /// `listen <addr>`：请**对端**在 `addr` 上监听，把拨进来的节点当它的子节点。
+    ///
+    /// 监听必须发生在被控端：本端替对端起监听器既无意义（防火墙在后面），
+    /// 也违背「谁能 bind 谁负责」的分工。所以这里只发一条
+    /// `ServiceRequest{kind: Listen, phase: Run}`，地址放在 `ConnectParam.addr`
+    /// （`ServiceRequest` 没有 target 字段，见 plan §4.14 E19），真正的
+    /// `bind` + 伪 admin 握手 + 编号分配都发生在对端（`Services::run_listen`）。
     async fn listen(&mut self, spec: &str) -> Outcome {
         let mut notes = self.drain_events();
-        notes.extend(
-            Outcome::unimplemented(
-                "listen",
-                &format!("等待 P7 联调；本端不能替 agent 起监听器：{spec}"),
-            )
-            .lines,
-        );
+        let key = self.next_key();
+        let msg = Message::ServiceRequest(ServiceRequest {
+            key,
+            kind: ServiceKind::Listen,
+            phase: ServicePhase::Run,
+            param: ServiceParam::Connect(ConnectParam {
+                addr: spec.to_owned(),
+            }),
+        });
+        notes.push(format!("请求 {} 在 {spec} 上监听", self.target().short()));
+        let outcome = self.send_service(msg, "listen 请求已发出".to_owned()).await;
+        notes.extend(outcome.lines);
         Outcome::lines(notes)
     }
 
@@ -1236,10 +1371,13 @@ impl Console {
             task.abort();
             notes.push(format!("已停止 forward（端口 {port}）"));
         }
-        for (port, task) in self.running.backwards.drain() {
-            task.abort();
-            notes.push(format!("已停止 backward（端口 {port}）"));
+        for (port, tasks) in self.running.backwards.drain() {
+            for task in tasks {
+                task.abort();
+            }
+            notes.push(format!("已停止 backward（远端端口 {port}）"));
         }
+        self.backwards.clear();
         let _ = self.handle.shutdown().await;
         Outcome {
             lines: notes,
@@ -1480,6 +1618,45 @@ async fn run_socks(
 }
 
 /// forward 监听循环：每条连接开一条 Forward 会话并中继。
+/// 反向映射的一条连接：开流 → 拨本地目标 → 回 Ready → 双向中继。
+///
+/// 顺序按 plan §4.14 E18：**先开流、再回 Ready**。反过来对端一收到
+/// `Ok` 就会把客户端数据推过来，而本端还没拨到本地目标。
+async fn relay_backward_session(handle: EngineHandle, key: SessionKey, target: String) {
+    let peer = key.origin;
+    let mut session = match handle.open_stream(key, peer, SessionKind::Backward).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(?key, error = %e, "反向映射：建流失败");
+            return;
+        }
+    };
+    let mut remote = match stowaway_core::backward::dial_remote(&target).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(target = %target, error = %e, "反向映射：拨本地目标失败");
+            let _ = handle
+                .close_session(key, stowaway_protocol::CloseReason::Refused)
+                .await;
+            return;
+        }
+    };
+    if handle
+        .ready_session(key, peer, SessionCode::Ok, format!("已连到 {target}"))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    match stowaway_core::relay_stream(&mut session, &mut remote).await {
+        Ok((up, down)) => tracing::debug!(?key, up, down, "反向映射会话结束"),
+        Err(e) => tracing::debug!(?key, error = %e, "反向映射会话中断"),
+    }
+    let _ = handle
+        .close_session(key, stowaway_protocol::CloseReason::Normal)
+        .await;
+}
+
 async fn run_forward(
     committed: forward::CommittedForward,
     run: Message,
@@ -1583,15 +1760,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listen_is_explicitly_unimplemented() {
+    async fn listen_asks_the_peer_and_reports_the_timeout() {
+        // 本端没有链路：请求发不出去也不该静默成功，必须留下「没收到应答」。
         let (mut c, handle, task) = console().await;
         let out = c
             .execute(Command::Listen("127.0.0.1:1080".to_owned()))
             .await;
         let text = out.to_string();
-        assert!(text.contains("listen"), "必须点名命令：{text}");
-        assert!(text.contains("尚未接通"), "必须说明没做：{text}");
+        assert!(text.contains("127.0.0.1:1080"), "必须回显地址：{text}");
+        assert!(
+            text.contains("超时") || text.contains("未发出") || text.contains("不可达"),
+            "必须说明没打通：{text}"
+        );
         assert!(out.keep_running);
+        shutdown(&handle, task).await;
+    }
+
+    #[tokio::test]
+    async fn backward_probe_without_peer_is_an_error_not_a_silent_success() {
+        let (mut c, handle, task) = console().await;
+        let out = c
+            .execute(Command::Backward {
+                remote_port: 9001,
+                local_port: 22,
+            })
+            .await;
+        let text = out.to_string();
+        assert!(text.contains("9001"), "必须回显远端端口：{text}");
+        assert!(text.contains("错误"), "探测不到就必须报错：{text}");
+        assert!(c.running_counts().2 == 0, "失败时不该留下登记：{text}");
         shutdown(&handle, task).await;
     }
 
