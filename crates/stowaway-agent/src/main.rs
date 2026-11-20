@@ -8,15 +8,20 @@ mod cli;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use stowaway_core::{
-    Event, HeartbeatConfig, ListenContext, NodeConfig, Runtime, RuntimeConfig, ServiceConfig,
-    Services,
+    EngineHandle, Event, HeartbeatConfig, ListenContext, MAX_UDP_DATAGRAM, NodeConfig, Runtime,
+    RuntimeConfig, ServiceConfig, ServiceTask, Services, UDP_IDLE_TIMEOUT_SECS, bind_outlet,
+    outlet_side_on,
 };
 use stowaway_core::{NodeIdAllocator, salt_from_secret};
 use stowaway_crypto::{CertFingerprint, KEY_LEN, Secret};
-use stowaway_protocol::{JoinAck, NodeId, NodeKind, SessionKey, TransportKind};
+use stowaway_protocol::{
+    JoinAck, Message, NodeId, NodeKind, ServiceKind, SessionCode, SessionDirection, SessionKey,
+    SessionKind, TransportKind,
+};
 use stowaway_transport::{ClientVerify, DialTarget, TlsConfig, TransportSpec};
 use tracing::{info, warn};
 
@@ -186,6 +191,17 @@ async fn serve(runtime: Runtime, args: &cli::Args, ack: &JoinAck) -> anyhow::Res
         match event {
             Event::SessionOpened { open, from } => {
                 info!(key = ?open.key, kind = ?open.kind, target = ?open.target, from = %from, "会话开启");
+                // UDP ASSOCIATE 的出口在这一侧（`SessionDirection::Inbound`：
+                // 接收方提供资源）。会话被接受之后立刻起出口，再回 Ready 告诉
+                // 发起方往哪发数据报（plan §4.14 E18、附录 A 第 30 行）。
+                if open.kind == SessionKind::Socks5Udp
+                    && open.direction == SessionDirection::Inbound
+                {
+                    let outlet_handle = handle.clone();
+                    if let Some(task) = spawn_udp_outlet(outlet_handle, open.key, from).await {
+                        tasks.push(task);
+                    }
+                }
                 targets.insert(open.key, open.target.clone());
             }
             Event::ServiceRequest { req, from } => {
@@ -265,6 +281,57 @@ fn runtime_config(args: &cli::Args, secret: &Secret) -> anyhow::Result<RuntimeCo
     cfg.heartbeat = Some(HeartbeatConfig::default());
     let _ = secret;
     Ok(cfg)
+}
+
+/// 为一条 UDP ASSOCIATE 会话起出口套接字，并把它的地址回报给发起方。
+///
+/// 出口绑在 `0.0.0.0:0`：目标地址由每个数据报自带的 SOCKS5 头决定，出口不
+/// 绑定固定对端。`ServiceTask` 的 `kind` 借用 `ServiceKind::Connect` —— 它只是
+/// 让任务列表有个标签，不参与线上语义（这条会话不是 `ServiceRequest` 驱动的）。
+async fn spawn_udp_outlet(
+    handle: EngineHandle,
+    key: SessionKey,
+    from: NodeId,
+) -> Option<ServiceTask> {
+    let socket = match bind_outlet("0.0.0.0:0".parse().expect("回环地址是常量")).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(key = ?key, error = %e, "UDP 出口无法绑定");
+            handle
+                .ready_session(key, from, SessionCode::Denied, "UDP 出口无法绑定")
+                .await
+                .ok();
+            return None;
+        }
+    };
+    let Ok(bind) = socket.local_addr() else {
+        return None;
+    };
+    let session = match handle.open_stream(key, from, SessionKind::Socks5Udp).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(key = ?key, error = %e, "UDP 会话流无法建立");
+            return None;
+        }
+    };
+    // 先把出口地址告诉发起方（`SessionReady.detail` 在 SOCKS5 UDP 这条路上
+    // 就是「出口绑定地址」，见 `udp_relay::ready_message` 的文档）。
+    let ready = stowaway_core::ready_message(key, bind);
+    if let Message::SessionReady(ready) = &ready {
+        handle
+            .ready_session(key, from, ready.code, ready.detail.clone())
+            .await
+            .ok();
+    }
+    let task = tokio::spawn(async move {
+        let idle = Duration::from_secs(UDP_IDLE_TIMEOUT_SECS);
+        let _ = outlet_side_on(socket, session, MAX_UDP_DATAGRAM, idle).await;
+    });
+    Some(ServiceTask {
+        key,
+        kind: ServiceKind::Connect,
+        handle: task,
+    })
 }
 
 /// 服务配置：下载目录、shell 编解码、SSH host key 策略。

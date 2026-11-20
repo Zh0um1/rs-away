@@ -40,7 +40,10 @@ use std::fmt;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
-use stowaway_core::{EngineHandle, Event, NodeIdAllocator, Snapshot, forward, socks, socks_server};
+use stowaway_core::{
+    EngineHandle, Event, MAX_UDP_DATAGRAM, NodeIdAllocator, Snapshot, UDP_IDLE_TIMEOUT_SECS,
+    bind_outlet, client_side_on, forward, socks, socks_server,
+};
 use stowaway_protocol::{
     ConnectParam, Memo, Message, NodeId, OpenSession, ServiceKind, ServiceParam, ServicePhase,
     ServiceRequest, SessionCode, SessionDirection, SessionKey, SessionKind, ShellParam, Shutdown,
@@ -1551,12 +1554,8 @@ async fn run_socks(
             let Ok(neg) = socks_server::negotiate(&mut client, &cfg).await else {
                 return;
             };
-            // UDP ASSOCIATE 不在本层实现：明确回「命令不支持」而不是装作成功。
             if socks_server::is_udp_associate(&neg) {
-                let _ = client
-                    .write_all(&socks::Reply::new(socks::REP_COMMAND_NOT_SUPPORTED).encode())
-                    .await;
-                let _ = client.flush().await;
+                udp_associate(client, handle, key, peer).await;
                 return;
             }
             // 发起方也要登记会话：对端回的 `SessionReady` 要靠会话表落账，
@@ -1614,6 +1613,78 @@ async fn run_socks(
             let (out, _inbound) = mpsc::channel(64);
             let _ = socks_server::pump(&mut session, &mut client, &out, key, peer).await;
         });
+    }
+}
+
+/// 一条 UDP ASSOCIATE 关联：本端起客户端侧入口，出口在对端。
+///
+/// 顺序按 plan §4.14 E18 与 v1 `agent/handler/socks.go:437` 的语义：**先让对端
+/// 把出口套接字建起来（`await_ready` 拿到 `Ok`），才回 REP 告诉客户端往哪发**。
+/// 反过来客户端会在对端还没 bind 时就开始发数据报，第一批必被丢。
+///
+/// REP 里回报的是**本端**的 UDP 入口地址（RFC 1928 §6：客户端把数据报发到
+/// BND.ADDR:BND.PORT）。对端出口的实际地址不需要回给客户端——数据报在会话里
+/// 走，客户端只认这一个入口。
+async fn udp_associate(
+    mut client: tokio::net::TcpStream,
+    handle: EngineHandle,
+    key: SessionKey,
+    peer: NodeId,
+) {
+    // 入口绑在回环上：这条入口只服务本机客户端，暴露到外网等于开一个开放中继。
+    let socket = match bind_outlet("0.0.0.0:0".parse().expect("回环地址是常量")).await {
+        Ok(s) => s,
+        Err(_) => {
+            let reply = socks::Reply::new(socks::REP_GENERAL_FAILURE);
+            let _ = client.write_all(&reply.encode()).await;
+            let _ = client.flush().await;
+            return;
+        }
+    };
+    let Ok(bind_addr) = socket.local_addr() else {
+        return;
+    };
+    if handle
+        .register_session(key, SessionKind::Socks5Udp)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let session = match handle.open_stream(key, peer, SessionKind::Socks5Udp).await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let _ = handle
+        .send(
+            Message::OpenSession(OpenSession {
+                key,
+                kind: SessionKind::Socks5Udp,
+                direction: SessionDirection::Inbound,
+                target: None,
+                param: ServiceParam::None,
+            }),
+            peer,
+        )
+        .await;
+    let reply = match handle.await_ready(key).await {
+        Ok(SessionCode::Ok) => socks::Reply::succeeded(bind_addr),
+        Ok(other) => socks::Reply::new(reply_of(other)),
+        Err(_) => socks::Reply::new(socks::REP_GENERAL_FAILURE),
+    };
+    if client.write_all(&reply.encode()).await.is_err() || client.flush().await.is_err() {
+        return;
+    }
+    let ok = reply.rep == socks::REP_SUCCEEDED;
+    if !ok {
+        return;
+    }
+    // 控制连接保持打开：客户端关掉它，RFC 1928 规定这条关联随之终止。
+    let (mut reader, mut writer) = client.into_split();
+    let idle = Duration::from_secs(UDP_IDLE_TIMEOUT_SECS);
+    tokio::select! {
+        _ = client_side_on(socket, session, MAX_UDP_DATAGRAM, idle) => {}
+        _ = tokio::io::copy(&mut reader, &mut writer) => {}
     }
 }
 
