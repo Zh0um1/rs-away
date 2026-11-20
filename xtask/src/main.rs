@@ -7,6 +7,9 @@ use std::process::{Command, ExitCode};
 /// `fetch-go-baseline`：为 plan.md §8.4 的 Go 黑盒行为对照预构建 v1 基线二进制。
 mod interop;
 
+/// `smoke`：`--non-interactive` 的双进程冒烟（plan.md §7 P7 出口判据）。
+mod smoke;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let task = args.first().map(String::as_str).unwrap_or("help");
@@ -31,6 +34,7 @@ fn main() -> ExitCode {
         "no-unsafe" => run_no_unsafe(),
         "build-matrix" => run_build_matrix(&args[1..]),
         "fetch-go-baseline" => interop::fetch(&repo_root(), &args[1..]),
+        "smoke" => smoke::run(&repo_root(), &args[1..]),
         "help" | "-h" | "--help" => {
             print_help();
             ExitCode::SUCCESS
@@ -54,6 +58,7 @@ fn print_help() {
   no-unsafe   校验 protocol/crypto/transport 三 crate 的 unsafe 计数为 0（§8.6 第六条）
   build-matrix 按 plan.md §4.13 的 11 个 blocking 组合交叉编译出包（`cargo xtask build-matrix --help`）
   fetch-go-baseline  预构建 Go v1 基线二进制（§8.4 行为对照用，`cargo xtask fetch-go-baseline --help`）
+  smoke       两个真二进制的 `--non-interactive` 冒烟（§7 P7 出口判据，`cargo xtask smoke --help`）
   help        显示本帮助"#
     );
 }
