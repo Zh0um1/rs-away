@@ -658,7 +658,11 @@ fn interop_forward_backward_probe_precedes_run() {
     let backward = BackwardSpec::new(key(), 9000, "127.0.0.1:22");
     let req = service_request(backward.probe());
     assert_eq!(req.phase, ServicePhase::Probe);
-    assert_eq!(req.kind, ServiceKind::Connect);
+    assert_eq!(
+        req.kind,
+        ServiceKind::Backward,
+        "backward 用独立的 ServiceKind：它要在对端 bind，与 Connect 是相反动作（附录 A 第 39 行）"
+    );
     assert_eq!(
         req.param,
         ServiceParam::Connect(stowaway_protocol::ConnectParam {

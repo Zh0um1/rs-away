@@ -54,13 +54,17 @@ impl BackwardSpec {
         }
     }
 
-    /// 探测消息：`ServiceRequest{kind: Connect, phase: Probe}`，参数是
+    /// 探测消息：`ServiceRequest{kind: Backward, phase: Probe}`，参数是
     /// **监听端口**（`listen:<port>`），与 forward 的「目标地址」不同。
+    ///
+    /// 用 `ServiceKind::Backward` 而不是复用 `Connect`：backward 要在对端
+    /// **bind 一个端口**，与「拨出去」是相反动作，复用会让响应方无法区分
+    /// （`docs/plan.md` 附录 A 第 39 行）。
     #[must_use]
     pub fn probe(&self) -> Message {
         Message::ServiceRequest(ServiceRequest {
             key: self.key,
-            kind: stowaway_protocol::ServiceKind::Connect,
+            kind: stowaway_protocol::ServiceKind::Backward,
             phase: ServicePhase::Probe,
             param: ServiceParam::Connect(ConnectParam {
                 addr: format!("listen:{}", self.local_port),
@@ -68,12 +72,12 @@ impl BackwardSpec {
         })
     }
 
-    /// 执行消息。
+    /// 执行消息（与探测同形，只是 `phase` 不同）。
     #[must_use]
     pub fn run(&self) -> Message {
         Message::ServiceRequest(ServiceRequest {
             key: self.key,
-            kind: stowaway_protocol::ServiceKind::Connect,
+            kind: stowaway_protocol::ServiceKind::Backward,
             phase: ServicePhase::Run,
             param: ServiceParam::Connect(ConnectParam {
                 addr: format!("listen:{}", self.local_port),
