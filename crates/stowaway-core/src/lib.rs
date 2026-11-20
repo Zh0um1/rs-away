@@ -72,7 +72,10 @@ pub use reuse::{
     CmdFailure, Fallback, REUSE_MAGIC_LEN, REUSE_SAME_SECONDS, ReuseConfig, ReuseError,
     decide_fallback, install, platform_supported, probe as probe_reuse, uninstall,
 };
-pub use runtime::{Link, Runtime, RuntimeConfig, Side, accept, bind, dial, follow, lead, side_of};
+pub use runtime::{
+    Link, Runtime, RuntimeConfig, Side, accept, bind, dial, dial_through_proxy, follow, lead,
+    side_of,
+};
 pub use service::{
     ListenContext, Outcome, ServiceConfig, ServiceTask, Services, backward_port, relay_stream,
 };

@@ -234,6 +234,57 @@ pub async fn dial(
     })
 }
 
+/// 经上游代理拨号，并在代理打通的字节流上照常完成 TLS + 前导 + 握手。
+///
+/// 与 [`dial`] 的唯一区别是「那条 TCP 是谁开的」：直接拨号由
+/// `RawDialer::connect` 自己开，这里由 `upstream_proxy::dial_via_proxy`
+/// 按 SOCKS5 / HTTP `CONNECT` 开。从代理回 `OK` 那一刻起，字节流与直连
+/// 没有任何区别，所以后续一律复用生产路径（`tcp::link_over` +
+/// `dialer_handshake` 的握手部分），不另写一份——修 #12 的前提是**只改
+/// 拨号这一段**，而不是把整条链路复制一份。
+///
+/// 约束（plan §4.11 / §5.2）：只支持 `raw` 传输。`ws` 的 `Host`/路径与
+/// `kcp` 的 UDP 语义都与「代理一条 TCP」不兼容，且两者的握手 transcript
+/// 会把传输种类算进去，硬塞只会得到难解释的校验失败。
+///
+/// # Errors
+/// 代理拨号失败、传输不是 `raw`、TLS 装配失败、握手失败。
+pub async fn dial_through_proxy(
+    spec: &TransportSpec,
+    target: &DialTarget,
+    proxy: &crate::upstream_proxy::ProxySpec,
+    role: NodeKind,
+    secret: &Secret,
+) -> Result<Link> {
+    if spec.kind != stowaway_protocol::TransportKind::Raw {
+        return Err(CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "上游代理只支持 raw 传输（tls 可叠加在 raw 上）；当前是 {:?}",
+                spec.kind
+            ),
+        )));
+    }
+    // 目标地址的写法：有 SNI/Host 时用 `<domain>:<port>`（虚拟主机才路由得到），
+    // 否则用 IP:port。这里的 `authority` 是**代理**要拨的目标，与 TLS 的 SNI
+    // 无关——`DialTarget.domain` 恰好同时能当两者用，是 v1 就有的约定。
+    let authority = match target.domain.as_deref() {
+        Some(domain) => format!("{domain}:{}", target.addr.port()),
+        None => target.addr.to_string(),
+    };
+    let stream = crate::upstream_proxy::dial_via_proxy(proxy, &authority).await?;
+    let link = stowaway_transport::tcp::link_over(stream, target).await?;
+    let mut codec = LinkCodec::new(link);
+    let handshake = codec
+        .client_handshake(role, spec.kind, None, secret)
+        .await?;
+    Ok(Link {
+        codec,
+        handshake,
+        peer: target.addr,
+    })
+}
+
 /// 绑一个监听器。
 ///
 /// # Errors
