@@ -401,51 +401,68 @@ impl RawDialer {
 
 impl Dialer for RawDialer {
     async fn connect(&self, target: &DialTarget) -> io::Result<Box<dyn Link>> {
-        {
-            let stream = TcpStream::connect(target.addr).await?;
-            apply_sockopts(&stream, self.nodelay, self.keepalive)?;
-
-            #[cfg(feature = "tls")]
-            if let Some(tls) = target.tls.as_ref() {
-                let config = tls.client_config().map_err(|e| to_io(&e))?;
-                let sni = target
-                    .domain
-                    .clone()
-                    .unwrap_or_else(|| target.addr.ip().to_string());
-                let name = rustls::pki_types::ServerName::try_from(sni.clone())
-                    .map_err(|_| crate::error::invalid_input(format!("非法 SNI：{sni}")))?;
-                let connector = tokio_rustls::TlsConnector::from(config);
-                let mut tls_stream = connector.connect(name, stream).await?;
-                // 前导写在 TLS 内层：必须先完成握手。它是线上约定的一部分，
-                // 服务端靠它把本连接判定为 Stowaway 流量。
-                tls_stream.write_all(&MAGIC).await?;
-                tls_stream.flush().await?;
-                return Ok(crate::link::boxed(RawLink::new(
-                    tls_stream,
-                    target.addr,
-                    TransportKind::Raw,
-                )));
-            }
-
-            #[cfg(not(feature = "tls"))]
-            if target.tls.is_some() {
-                return Err(to_io(&TransportError::FeatureDisabled {
-                    kind: "tls",
-                    feature: "tls",
-                }));
-            }
-
-            // 明文：连上就先自报家门，服务端 `peek` 才有东西可看。
-            let mut stream = stream;
-            stream.write_all(&MAGIC).await?;
-            stream.flush().await?;
-            Ok(crate::link::boxed(RawLink::new(
-                stream,
-                target.addr,
-                TransportKind::Raw,
-            )))
-        }
+        let stream = TcpStream::connect(target.addr).await?;
+        apply_sockopts(&stream, self.nodelay, self.keepalive)?;
+        link_over(stream, target).await
     }
+}
+
+/// 在**已经建立**的 TCP 流上完成「TLS（可选）+ 本协议前导」，交出一条 [`Link`]。
+///
+/// 拨号路径不必也不该自己走一遍这个流程：`RawDialer::connect` 就是
+/// `TcpStream::connect` + 这个函数。分离出来是为了**上游代理**——链路上的
+/// 那条 TCP 是对代理拨号得来的（RFC 1928 `CONNECT` / HTTP `CONNECT` 之后
+/// 代理已经把字节流透给目标），从这一刻起它与直接拨号没有区别，所以
+/// TLS 与 4 字节前导必须照常走一遍。
+///
+/// 若代理路径重写一份「连上就写 MAGIC」，两处必然分叉：一处改了前导长度
+/// 另一处忘改时，现象是 `BadVersion { actual: b'S' }` 这种很难定位的握手失败。
+///
+/// # Errors
+/// TLS 装配失败、SNI 非法、TLS 握手失败、前导写入失败。
+pub async fn link_over<S>(stream: S, target: &DialTarget) -> io::Result<Box<dyn Link>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    #[cfg(feature = "tls")]
+    if let Some(tls) = target.tls.as_ref() {
+        let config = tls.client_config().map_err(|e| to_io(&e))?;
+        let sni = target
+            .domain
+            .clone()
+            .unwrap_or_else(|| target.addr.ip().to_string());
+        let name = rustls::pki_types::ServerName::try_from(sni.clone())
+            .map_err(|_| crate::error::invalid_input(format!("非法 SNI：{sni}")))?;
+        let connector = tokio_rustls::TlsConnector::from(config);
+        let mut tls_stream = connector.connect(name, stream).await?;
+        // 前导写在 TLS 内层：必须先完成握手。它是线上约定的一部分，
+        // 服务端靠它把本连接判定为 Stowaway 流量。
+        tls_stream.write_all(&MAGIC).await?;
+        tls_stream.flush().await?;
+        return Ok(crate::link::boxed(RawLink::new(
+            tls_stream,
+            target.addr,
+            TransportKind::Raw,
+        )));
+    }
+
+    #[cfg(not(feature = "tls"))]
+    if target.tls.is_some() {
+        return Err(to_io(&TransportError::FeatureDisabled {
+            kind: "tls",
+            feature: "tls",
+        }));
+    }
+
+    // 明文：连上就先自报家门，服务端 `peek` 才有东西可看。
+    let mut stream = stream;
+    stream.write_all(&MAGIC).await?;
+    stream.flush().await?;
+    Ok(crate::link::boxed(RawLink::new(
+        stream,
+        target.addr,
+        TransportKind::Raw,
+    )))
 }
 
 /// 读掉 4 字节 `MAGIC` 前导（接受端专用）。
