@@ -19,5 +19,10 @@ portable-pty = { workspace = true }
 russh = { workspace = true }
 sha2 = { workspace = true }
 
+[features]
+# 打开它才能跑「上行 ws、子链路 kcp」的混跑判据（plan §8.5 附加）。
+# 之所以要显式 feature：`tokio_kcp` 只在需要时编译，默认构建不带。
+transport-kcp = ["stowaway-transport/transport-kcp"]
+
 [lints]
 workspace = true

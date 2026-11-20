@@ -24,19 +24,27 @@
 //!    变成可判定的断言（`admin_alloc.owns(a1)` 为真、`admin_alloc.owns(a2)`
 //!    为假）。
 //!
-//! ## 为什么子链路不是 kcp
+//! ## 为什么子链路是 kcp 而不是再开一条 raw
 //!
-//! 判据原文是「上行 ws、子链路 kcp」。kcp 传输在 `crates/stowaway-transport`
-//! 里是**非默认 feature**（`transport-kcp`，见该 crate 的 `Cargo.toml`），而
-//! 本任务的边界是「只新增测试文件、不改任何既有文件（含 Cargo.toml）」，
-//! `cargo test -p stowaway-core` 不会打开该 feature —— `listener_for` 在未
-//! 编译 kcp 时直接返回 `TransportError::FeatureDisabled`。把 `LinkMeta` 的
-//! kind 改成 Kcp 之类的手脚不构成证据：那只是「把声明当真」，而本判据的全部
-//! 意义是「声明必须与实际传输一致」。因此这里用另一套**真正不同的实现**
-//! （raw 裸 TCP）作子链路，保留「两种传输在同一次运行里各自独立握手」这一
-//! 可验证内核。若将来打开 `transport-kcp`，只需把 `CHILD_SPEC` 换成
-//! `kcp://127.0.0.1:0?conv=7`、把子链路的期望值从 `TransportKind::Raw` 改为
-//! `TransportKind::Kcp`，其余断言（拓扑、编号、数据面）一字不用改。
+//! 判据原文是「上行 ws、子链路 kcp」。若子链路也用 raw，两条链路的
+//! `TransportKind` 就都是 `Raw`，`peer_transport` 的断言只能证明「读到了
+//! 一个值」，无法区分「哪一段是哪一段」——那等于把判据做成自证。
+//!
+//! `transport-kcp` 是 `stowaway-transport` 的非默认 feature，因此本测试
+//! 需要 `stowaway-core` 的同名 feature（`crates/stowaway-core/Cargo.toml`
+//! 里 `transport-kcp = ["stowaway-transport/transport-kcp"]`）：
+//!
+//! ```text
+//! cargo test -p stowaway-core --features transport-kcp --test mixed_transport_e2e
+//! ```
+//!
+//! 未打开该 feature 时，`listener_for(kcp_spec)` 返回
+//! `TransportError::FeatureDisabled`，测试会**响亮地失败**而不是静默降级
+//! —— 这正是想要的：判据没跑就应该是红的，而不是绿的。
+//!
+//! kcp 基于 UDP、`conv` 由 secret 派生（`stowaway_crypto::kcp_conv`），
+//! 因此两段链路的 `max_frame` 也不同（kcp = `mtu × 8`，raw = `FRAGMENT_MAX`）
+//! —— 这正是「两种传输实现各自独立」的实质，而不只是两个字符串不同。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -56,7 +64,7 @@ use stowaway_transport::{DialTarget, TransportSpec};
 /// 上行（admin ←→ A1）：WebSocket。
 const UPSTREAM_SPEC: &str = "ws://127.0.0.1:0?path=/deadbeef";
 /// 子链路（A1 ←→ A2）：裸 TCP。理由见文件头「为什么子链路不是 kcp」。
-const CHILD_SPEC: &str = "raw://127.0.0.1:0";
+const CHILD_SPEC: &str = "kcp://127.0.0.1:0";
 
 fn secret() -> Arc<Secret> {
     Arc::new(Secret::load("mixed-transport-e2e-secret", 8).expect("secret"))
@@ -107,10 +115,13 @@ async fn wait_event(rt: &mut Runtime, what: &str, pred: impl Fn(&Event) -> bool)
         .unwrap_or_else(|_| panic!("等待 {what} 超时"))
 }
 
-/// 判据主用例：一条 ws 上行 + 一条 raw 子链路，同一次运行里建成两层树，
+/// 判据主用例：一条 ws 上行 + 一条 kcp 子链路，同一次运行里建成两层树，
 /// 并且一条 admin → A2 的消息真的送达 A2 的引擎。
+///
+/// 未开 `transport-kcp` 时必须**失败**（`FeatureDisabled`），不能跳过：
+/// 判据没跑就该是红的。
 #[tokio::test]
-async fn ws_upstream_and_raw_child_link_share_one_tree() {
+async fn ws_upstream_and_kcp_child_link_share_one_tree() {
     let shared = secret();
 
     // —— 1) admin：绑 ws 监听并起引擎（根节点，深度 0）。 ——
@@ -219,14 +230,14 @@ async fn ws_upstream_and_raw_child_link_share_one_tree() {
         "上行对端必须是回环地址"
     );
 
-    // —— 2) A1 绑 raw 监听，做 A2 的父节点。 ——
+    // —— 2) A1 绑 kcp 监听，做 A2 的父节点。 ——
     let child_spec = TransportSpec::parse(CHILD_SPEC).expect("解析子链路规格");
     let (mut raw_listener, child_kind, child_addr) =
-        bind(&child_spec, None).await.expect("A1 绑 raw 监听");
+        bind(&child_spec, None).await.expect("A1 绑 kcp 监听");
     assert_eq!(
         child_kind,
-        TransportKind::Raw,
-        "子链路必须落在 raw 传输实现上"
+        TransportKind::Kcp,
+        "子链路必须落在 kcp 传输实现上"
     );
 
     let a1_handle = a1_rt.handle();
@@ -249,13 +260,13 @@ async fn ws_upstream_and_raw_child_link_share_one_tree() {
                 None,
             )
             .await
-            .expect("A1 接受 raw 入站");
+            .expect("A1 接受 kcp 入站");
             assert_eq!(link.handshake.peer_kind, NodeKind::Agent);
             // 混跑的正面证据 ③：子链路的对端声明的是 Raw，不是上行那条 ws。
             assert_eq!(
                 link.handshake.peer_transport,
-                TransportKind::Raw,
-                "子链路的对端声明传输必须是 Raw"
+                TransportKind::Kcp,
+                "子链路的对端声明传输必须是 Kcp"
             );
             assert_eq!(side_of(link.handshake.peer_kind), Side::Parent);
             let a2 = lead(
@@ -279,13 +290,13 @@ async fn ws_upstream_and_raw_child_link_share_one_tree() {
                 shared.as_ref(),
             )
             .await
-            .expect("A2 拨号 raw 子链路");
+            .expect("A2 拨号 kcp 子链路");
             assert_eq!(link.handshake.peer_kind, NodeKind::Admin);
             // 混跑的正面证据 ④：A2 侧读到 Raw。
             assert_eq!(
                 link.handshake.peer_transport,
-                TransportKind::Raw,
-                "子链路的客户端声明传输必须是 Raw"
+                TransportKind::Kcp,
+                "子链路的客户端声明传输必须是 Kcp"
             );
             assert_eq!(side_of(link.handshake.peer_kind), Side::Child);
             let (rt, ack) = follow(link.codec, a2_cfg, a1_id, NodeKind::Admin)
