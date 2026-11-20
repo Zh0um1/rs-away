@@ -425,6 +425,16 @@ impl Args {
                     "`--rehost {host}` 不能是未指定地址：SO_REUSEPORT 要和后端**错开地址**才能各自收到该收的连接"
                 ));
             }
+            // 回落目标恒为 `127.0.0.1:<report>`。若 `--rehost` 恰好也是
+            // `127.0.0.1`，监听地址与回落目标就是**同一个端点**：陌生流量会被
+            // 转回自己身上，一条连接在自己的两条监听之间来回弹——实测这种配置
+            // 能 bind 成功、能起服务，只是每条陌生连接都会打转。
+            if host == std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+                return fail(
+                    "`--rehost 127.0.0.1` 会让回落到自己身上（回落目标就是 127.0.0.1:<report>）：请给对外地址"
+                        .to_owned(),
+                );
+            }
             let spec = self.upstream_spec().map_err(|e| ArgsError::BadReuse {
                 reason: e.to_string(),
             })?;
@@ -804,6 +814,14 @@ mod tests {
         let unspecified = parse(&["agent", "--rehost", "0.0.0.0", "--report", "8443"]);
         assert!(matches!(
             unspecified.check_reuse(),
+            Err(ArgsError::BadReuse { .. })
+        ));
+
+        // 回落目标恒为 `127.0.0.1:<report>`；`--rehost` 也是它就成了同端点，
+        // 陌生流量会被转回自己身上（实测能 bind、能起服务，只是每条陌生连接打转）。
+        let loopback = parse(&["agent", "--rehost", "127.0.0.1", "--report", "8443"]);
+        assert!(matches!(
+            loopback.check_reuse(),
             Err(ArgsError::BadReuse { .. })
         ));
 
