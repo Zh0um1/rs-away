@@ -547,6 +547,7 @@ pub enum SessionDirection { Outbound, Inbound }   // 相对**接收方**：Outbo
 | E25 | §4.8 `FileParam` 只有 `name/size/sha256/offset`，而上传与下载是两条相反的数据流（v1 分别用 `FILESTATREQ`/`FILEDOWNREQ` 两套消息） | 在 `FileParam` 末尾追加 `direction: FileDirection{Upload(默认), Download}`，两个方向共用 `ServiceKind::File`；下载方向由发送方在流首写 40 字节清单头（`size u64 LE ‖ sha256`，`file::MANIFEST_LEN`） | `ServiceRequest` 没有 `direction` 字段（那是 `OpenSession` 的属性），而给「上传」「下载」各加一个 `ServiceKind` 会让应答方写两份几乎相同的「分块 + sha256 校验」代码。方向是**参数**而不是**能力**，压进参数更贴合语义；清单头则解决「接收方事先不知道长度和摘要」——让发送方先声明，接收方才能边收边算、下到 `.part` 验过再 rename |
 | E26 | §4.11「非本协议流量回落 `127.0.0.1:<report>`」 | 回落目标不写死在监听器里，而是 `ReuseConfig` + `decide_fallback` 先算、再用 `AnyListener::with_fallback(Option<SocketAddr>)` 链式注入；只有 `Raw` 变体真的接线，`Ws`/`Kcp` 是静默空操作 | 决策（装没装规则、有没有 `--report`）与执行（把字节转出去）分属两层：前者要能被纯函数单测覆盖，后者要能被 e2e 覆盖。`ws` 判成 `Ws` 就说明它确实是 HTTP 升级请求、接错端口该回 400；`kcp` 是数据报，没有「一条流」可转。把这三个判断留在同一条链式调用上，比让每个监听器各自重算一遍更不容易分叉 |
 | E27 | 想当然地用 `cargo build -j 2` 同时构建两个二进制 | 链接阶段必须 `-j 1`：并行链接两个 ~90MB 的二进制会让 LLVM 自己崩（`libLLVM.so.23.1-rust-1.100.0-stable` + `PLEASE submit a bug report to llvm`），不是我们的代码问题。`xtask build-matrix` 与 `xtask smoke` 内部都用 `-j 1`，CI 同理；单 crate 构建不受影响 |
+| E28 | §4.11 把端口复用的两半（「iptables 规则劫持」与「SO_REUSEPORT 回落」）并列写在能力清单里，但 §6 的 CLI 映射只给了 `--reuse-magic`（规则那半），`-rehost` 一行没有实现动作 | 补齐 `--rehost <ip>`：`TransportSpec` 增加 `reuse_port: bool`（规格串 `?reuse_port=1`，**只对 raw 开口**），`RawListener::bind_reuse_port` 先 `SO_REUSEADDR` + `SO_REUSEPORT` 再 `bind`/`listen`；agent 新增 `cli::Mode::ReusePort` 与 `run_passive_reuse`（监听 `<rehost>:<report>`，回落目标恒为 `127.0.0.1:<report>`），它与 `--reuse-magic` **互斥**、不需要 root、不装任何规则；`Passive` 与 `ReusePort` 共用同一段 `accept_loop` | 两半的机制完全不同：规则那半靠 netfilter 在 PREROUTING 改道（Linux + root + `-m string`/`-m recent`），`SO_REUSEPORT` 那半靠内核在**同一端口的多个 listener** 之间按四元组分流（Linux/macOS/BSD，不需要 root）。把 `--rehost` 漏掉等于承诺了一个只实现一半的能力。互斥而非叠加：两套机制会改道同一批 SYN，叠加时行为取决于谁先动手、无从解释。`accept_loop` 共用是因为从 `accept` 到 `serve` 这段对 admin 来说本该完全一样，两种监听方式不该导致接入后行为分叉。**判据**：`reuse_port_spec_lets_a_listener_share_the_endpoint` 先在 `raw://127.0.0.1:0?reuse_port=1` 上听，再在**同一个端点**上听第二条（只靠 `SO_REUSEPORT` 才能同时成功），并反向断言不带这一位的普通 `bind` 必须冲突——否则测试证明不了「是 `SO_REUSEPORT` 让它成功的」；`rehost_and_reuse_magic_are_mutually_exclusive` 覆盖互斥、未指定地址、缺 `--report`、非 raw 四种拒绝路径 |
 
 ---
 
@@ -638,7 +639,7 @@ v2 **不读** v1 配置与持久化格式。迁移动作：重新生成 `--reuse
 | `-l <port>` | `--listen <port>` / `--up raw://host:port` | 端口复用模式下语义不变 |
 | `-c <addr>` | `--connect <addr>` | |
 | `-reconnect <s>` | `--reconnect <s>` | 语义不变（默认不重连，§4.12） |
-| `-rehost <host>` | `--reuse-host <host>` | |
+| `-rehost <host>` | `--rehost <ip>` | 语义不变：`SO_REUSEPORT` 模式下监听 `<ip>:<report>`，非本协议流量转给 `127.0.0.1:<report>`；与 `--reuse-magic` 互斥（那是 iptables 那条路），不需要 root。主机名在解析期拒绝（v1 同样只收 IP 字面量） |
 | `-report <port>` | `--report <port>` | |
 | `-socks5-proxy{u,p}` | `--socks5-proxy[-user|-pass]` | |
 | `-http-proxy` | `--http-proxy` | 修 #12 的 `Proxy-Authorization` |

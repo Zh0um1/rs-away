@@ -137,6 +137,15 @@ pub struct Args {
     #[arg(long)]
     pub report: Option<u16>,
 
+    /// `SO_REUSEPORT` 模式的对外监听地址（v1 `--rehost`）。
+    ///
+    /// 与 `--reuse-magic` 是**两条互斥的路**：magic 靠 iptables 把发往
+    /// `--report` 的 SYN 改道到 `--listen`，需要 root；`--rehost` 让本进程
+    /// 自己在对外地址上 `SO_REUSEPORT` 监听同一个端口，不需要 root，也不
+    /// 需要 magic。两者都给是配置错误，会在 [`Args::check_reuse`] 报出来。
+    #[arg(long)]
+    pub rehost: Option<std::net::IpAddr>,
+
     /// 允许降级运行（复用规则装不上时继续，plan §4.11）。
     #[arg(long)]
     pub allow_degraded: bool,
@@ -185,6 +194,18 @@ pub enum Mode {
         /// 监听端口。
         port: u16,
     },
+    /// 被动 + `SO_REUSEPORT`（v1 的 `SOREUSE_PASSIVE`，`--rehost <ip>`）。
+    ///
+    /// 与 [`Self::Passive`] 的区别只在「监听怎么建立」：`Passive` 独占端口，
+    /// `ReusePort` 沿 `SO_REUSEPORT` 与真实后端共享端口，并把非本协议流量
+    /// 转给 `127.0.0.1:<report>`（plan §4.11）。**不需要 root、不碰 iptables**，
+    /// 但要显式给出对外地址——这正是 `--rehost` 存在的理由。
+    ReusePort {
+        /// 对外监听地址（IP 字面量；v1 用 `net.ParseIP` 校验）。
+        host: std::net::IpAddr,
+        /// 复用端口（v1 里是 `--report`，同一数值既是监听端口也是回落目标端口）。
+        port: u16,
+    },
 }
 
 /// 参数互相矛盾时的错误。
@@ -225,6 +246,25 @@ impl Args {
     /// 见 [`ArgsError`]。
     pub fn mode(&self) -> Result<Mode, ArgsError> {
         let via_proxy = self.socks5_proxy.is_some() || self.http_proxy.is_some();
+        if let Some(host) = self.rehost {
+            // v1 的 `SOREUSE_PASSIVE`：没有 `-l`，监听端口来自 `--report`
+            //（`agent/initial/parser.go:81-84`）。这里同样要求「给了 rehost
+            // 就必须给 report」，但把判断留给 `check_reuse` 统一报错，
+            // 否则会出现「mode() 报一种错、check_reuse() 报另一种」。
+            let Some(port) = self.report else {
+                return Err(ArgsError::BadReuse {
+                    reason: "`--rehost` 需要同时给出 `--report <port>`（复用端口）".to_owned(),
+                });
+            };
+            if let Some(addr) = &self.connect {
+                return Err(ArgsError::BadReuse {
+                    reason: format!(
+                        "`--rehost` 与 `--connect {addr}` 互斥：前者是被动复用监听，后者是主动拨号"
+                    ),
+                });
+            }
+            return Ok(Mode::ReusePort { host, port });
+        }
         match (&self.connect, self.listen) {
             (Some(addr), _) => Ok(Mode::Active {
                 addr: addr.clone(),
@@ -351,12 +391,57 @@ impl Args {
     /// # Errors
     /// 组合非法时返回 [`ArgsError::BadReuse`]。
     pub fn check_reuse(&self) -> Result<(), ArgsError> {
+        let fail = |reason: String| Err(ArgsError::BadReuse { reason });
+
+        // `--rehost` 与 `--reuse-magic` 是两条互斥的路（plan §4.11 的两半：
+        // SO_REUSEPORT 与 iptables）。同时给等于想让两套机制改道同一批 SYN，
+        // 行为不可预测，必须在启动期拒绝而不是挑一个跑。
+        if let Some(host) = self.rehost {
+            if self.reuse_magic.is_some() {
+                return fail(
+                    "`--rehost` 与 `--reuse-magic` 互斥：前者用 SO_REUSEPORT 让本进程与后端共享端口，后者用 iptables 把流量改道过来"
+                        .to_owned(),
+                );
+            }
+            if self.listen.is_some() {
+                return fail(
+                    "`--rehost` 自己决定监听（对外地址 + `--report` 端口），不能再给 `--listen`"
+                        .to_owned(),
+                );
+            }
+            if self.report == Some(0) {
+                return fail(
+                    "`--report 0` 不是可用端口（127.0.0.1:0 等于没有回落目标）".to_owned(),
+                );
+            }
+            if self.report.is_none() {
+                return fail(
+                    "`--rehost` 需要同时给出 `--report <port>`（复用端口，也是回落目标端口）"
+                        .to_owned(),
+                );
+            }
+            if host.is_unspecified() {
+                return fail(format!(
+                    "`--rehost {host}` 不能是未指定地址：SO_REUSEPORT 要和后端**错开地址**才能各自收到该收的连接"
+                ));
+            }
+            let spec = self.upstream_spec().map_err(|e| ArgsError::BadReuse {
+                reason: e.to_string(),
+            })?;
+            if spec.kind != stowaway_protocol::TransportKind::Raw {
+                return fail(format!(
+                    "`--rehost` 只能与 `raw` 组合（SO_REUSEPORT 只对 TCP 有意义），当前是 `{:?}`",
+                    spec.kind
+                ));
+            }
+            return Ok(());
+        }
+
         let has_magic = self.reuse_magic.is_some();
         let has_report = self.report.is_some();
         if !has_magic && !has_report {
             return Ok(());
         }
-        let fail = |reason: String| Err(ArgsError::BadReuse { reason });
         if has_magic != has_report {
             return fail(
                 "`--reuse-magic` 与 `--report` 必须成对给出（前者是标记，后者是非本协议流量的回落目标）"
@@ -663,5 +748,82 @@ mod tests {
             "9000",
         ]);
         assert!(matches!(ws.check_reuse(), Err(ArgsError::BadReuse { .. })));
+    }
+
+    #[test]
+    fn rehost_is_a_reuse_port_mode_not_a_listen_port_mode() {
+        // v1 `SOREUSE_PASSIVE`：`--rehost <ip> --report <port>`，没有 `-l`。
+        let args = parse(&["agent", "--rehost", "203.0.113.7", "--report", "8443"]);
+        assert!(args.check_reuse().is_ok(), "rehost 组合必须合法");
+        match args.mode() {
+            Ok(Mode::ReusePort { host, port }) => {
+                assert_eq!(host.to_string(), "203.0.113.7");
+                assert_eq!(port, 8443, "复用端口就是 --report");
+            }
+            other => panic!("rehost 必须走 ReusePort 模式，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rehost_and_reuse_magic_are_mutually_exclusive() {
+        // 两条路都能改道同一批 SYN，同时给等于让行为取决于谁先动手。
+        let both = parse(&[
+            "agent",
+            "--rehost",
+            "203.0.113.7",
+            "--report",
+            "8443",
+            "--reuse-magic",
+            "0123456789abcdef",
+        ]);
+        assert!(matches!(
+            both.check_reuse(),
+            Err(ArgsError::BadReuse { .. })
+        ));
+
+        // rehost 自己决定监听，再给 -l 是两套端口来源。
+        let with_listen = parse(&[
+            "agent",
+            "-l",
+            "8080",
+            "--rehost",
+            "203.0.113.7",
+            "--report",
+            "8443",
+        ]);
+        assert!(matches!(
+            with_listen.check_reuse(),
+            Err(ArgsError::BadReuse { .. })
+        ));
+
+        // 没有 --report 就没有回落目标，也就没有「本进程只接本协议」的余地。
+        let no_report = parse(&["agent", "--rehost", "203.0.113.7"]);
+        assert!(matches!(no_report.mode(), Err(ArgsError::BadReuse { .. })));
+
+        // 未指定地址会让内核把本协议连接也分给后端。
+        let unspecified = parse(&["agent", "--rehost", "0.0.0.0", "--report", "8443"]);
+        assert!(matches!(
+            unspecified.check_reuse(),
+            Err(ArgsError::BadReuse { .. })
+        ));
+
+        // SO_REUSEPORT 只对 TCP 有意义。
+        let ws = parse(&[
+            "agent",
+            "--rehost",
+            "203.0.113.7",
+            "--report",
+            "8443",
+            "--up",
+            "ws://h:1",
+        ]);
+        assert!(matches!(ws.check_reuse(), Err(ArgsError::BadReuse { .. })));
+    }
+
+    #[test]
+    fn rehost_rejects_non_ip_literals_at_parse_time() {
+        // v1 用 `net.ParseIP` 拒绝主机名（`parser.go:134-136`）；这里同样在
+        // clap 解析期就失败，而不是等到 bind 时才发现解析不了。
+        assert!(Args::try_parse_from(["agent", "--rehost", "not-an-ip", "--report", "1"]).is_err());
     }
 }

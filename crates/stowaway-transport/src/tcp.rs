@@ -167,6 +167,55 @@ impl RawListener {
         })
     }
 
+    /// 在 `SO_REUSEPORT` 语义下绑定并监听（v1 `--rehost`，plan §4.11）。
+    ///
+    /// 与 [`Self::bind`] 的唯一区别是**监听前**先给 socket 打开
+    /// `SO_REUSEPORT`/`SO_REUSEADDR`：这样真实后端可以先在
+    /// `127.0.0.1:<report>` 上听同一个端口，而本进程在对外地址
+    /// `<rehost>:<report>` 上同时听——两者并不冲突，内核按四元组转发。
+    ///
+    /// 与 iptables 模式的分工：iptables 靠 `REDIRECT` 把发往复用端口的
+    /// SYN 拽到 `--listen` 端口，除 root 之外什么都要求；`SO_REUSEPORT`
+    /// 不碰规则表、也不需要 root，代价是**必须知道对外地址**（`rehost`），
+    /// 且内核会把同一端口的连接在多个 listener 间做四元组哈希分配——如果
+    /// 后端也在 `0.0.0.0` 上听同一个端口，一部分本协议连接会被分给后端，
+    /// 因此后端必须绑在**另一个具体地址**（惯例是 `127.0.0.1`）。
+    ///
+    /// # Errors
+    /// 端口被占用（未开 `SO_REUSEPORT` 时）、无 `SO_REUSEPORT` 支持的平台、
+    /// 权限不足等返回 [`TransportError::Io`]。
+    pub async fn bind_reuse_port(
+        addr: SocketAddr,
+        tls: Option<crate::TlsConfig>,
+        nodelay: bool,
+        keepalive: Option<Duration>,
+    ) -> Result<Self> {
+        let domain = if addr.is_ipv6() {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        };
+        let sock =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        // `SO_REUSEADDR` 先开：BSD 系把「同一端口被多个 listener 共享」也认它，
+        // 而 `SO_REUSEPORT` 在 Linux 上单独一项就够。两者都开是 v1
+        // （`libp2p/go-reuseport`）的实际效果，也避免 macOS 上单开 REUSEPORT 失败。
+        sock.set_reuse_address(true)?;
+        set_reuse_port(&sock)?;
+        sock.set_nonblocking(true)?;
+        sock.bind(&socket2::SockAddr::from(addr))?;
+        sock.listen(1024)?;
+        let std_listener: std::net::TcpListener = sock.into();
+        let listener = TcpListener::from_std(std_listener)?;
+        Ok(Self {
+            listener,
+            tls,
+            nodelay,
+            keepalive,
+            fallback: None,
+        })
+    }
+
     /// 设置端口复用回落目标（链式构造）。
     ///
     /// `Some(addr)`：判定为非本协议流量时，把整条流原样转给 `addr`，并继续
@@ -483,6 +532,25 @@ async fn consume_preamble<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<()
     Ok(())
 }
 
+/// 打开 `SO_REUSEPORT`，不支持该选项的平台给出明确错误而不是静默忽略。
+///
+/// Windows 与 Solaris 没有 `SO_REUSEPORT`（Windows 只有语义不同的
+/// `SO_REUSEADDR`，遇 `SO_EXCLUSIVEADDRUSE` 时 `bind` 直接失败），
+/// plan §4.11 已明确「Windows 不支持端口复用」——这里把「不支持」变成
+/// 启动期的可读错误，而不是等到 `bind` 报一个更难解释的 `EADDRINUSE`。
+#[cfg(unix)]
+fn set_reuse_port(sock: &socket2::Socket) -> io::Result<()> {
+    sock.set_reuse_port(true)
+}
+
+#[cfg(not(unix))]
+fn set_reuse_port(_sock: &socket2::Socket) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "本平台没有 SO_REUSEPORT（Windows 不支持端口复用，plan §4.11）",
+    ))
+}
+
 /// 应用 `TCP_NODELAY` / `SO_KEEPALIVE`（v1 全仓零命中，见 plan §2.10）。
 fn apply_sockopts(
     stream: &TcpStream,
@@ -533,6 +601,26 @@ mod tests {
         let long = [0xabu8; 32];
         assert_eq!(hex_preview(&long).len(), 16);
         assert_eq!(hex_preview(&[0x53, 0x54, 0x57, 0x32]), "53545732");
+    }
+
+    #[tokio::test]
+    async fn reuse_port_allows_two_listeners_on_the_same_address() {
+        // v1 `--rehost` 的前提：本进程在对外地址上听，真实后端在另一个地址上
+        // 听同一个端口。SO_REUSEPORT 让「同址同端口」也能共存，所以这里用
+        // 最严格的形式验证——两条都在同一地址上 bind 必须都成功。
+        let first =
+            RawListener::bind_reuse_port("127.0.0.1:0".parse().expect("addr"), None, true, None)
+                .await
+                .expect("首次 bind_reuse_port");
+        let addr = Listener::local_addr(&first).expect("local_addr");
+        let second = RawListener::bind_reuse_port(addr, None, true, None)
+            .await
+            .expect("第二次 bind_reuse_port 必须成功（SO_REUSEPORT）");
+        assert_eq!(Listener::local_addr(&second).expect("local_addr"), addr);
+        // 反向对照：不带 SO_REUSEPORT 的普通 bind 必须失败，否则这条测试
+        // 证明不了「是 SO_REUSEPORT 让它成功的」。
+        let plain = TcpListener::bind(addr).await;
+        assert!(plain.is_err(), "普通 bind 在同址同端口上必须冲突");
     }
 
     #[tokio::test]

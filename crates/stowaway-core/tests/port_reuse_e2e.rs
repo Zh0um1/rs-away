@@ -183,6 +183,42 @@ async fn scenario_10_without_fallback_foreign_traffic_is_a_loud_error() {
     client.await.expect("client task");
 }
 
+/// `SO_REUSEPORT` 那一半（v1 `--rehost`）：规格里带 `reuse_port=1` 时，
+/// `stowaway_core::bind` 必须能与「同样声明了共享」的套接字在同一地址上共存。
+///
+/// 这是 `--rehost` 的全部机制：本进程与真实后端共享 `<rehost>:<report>`，
+/// 内核按四元组把连接分开（后端必须绑在**另一个地址**上，例如
+/// `127.0.0.1`）。判据取最严格的形式——两条都在同一地址同一端口上 bind，
+/// 只靠 `SO_REUSEPORT` 才能同时成功；不带这一位的普通 bind 必须失败，
+/// 否则这条测试证明不了「是 `SO_REUSEPORT` 让它成功的」。
+#[tokio::test]
+async fn reuse_port_spec_lets_a_listener_share_the_endpoint() {
+    // ① 第一条带 reuse_port=1 的监听：占住一个端口，扮演「已经在听的真实后端」。
+    let port_spec = TransportSpec::parse("raw://127.0.0.1:0?reuse_port=1").expect("spec");
+    assert!(port_spec.reuse_port, "参数必须被解析进字段");
+    let (_first, kind, addr) = bind(&port_spec, None).await.expect("首个 reuse_port 监听");
+
+    // ② 第二条同样声明共享的监听：必须能绑到同一个端点（这就是 --rehost
+    //    与真实后端并存的那一步）。
+    let spec = TransportSpec::parse(&format!("raw://{addr}?reuse_port=1")).expect("spec");
+    let (listener, kind2, local) = bind(&spec, None).await.expect("reuse_port 必须能共享端口");
+    assert_eq!(local, addr, "共享的是同一个端点");
+    assert_eq!(listener.kind(), kind);
+    assert_eq!(kind2, kind);
+
+    // ② 不带这一位的规格：同址同端口必须冲突。
+    let plain = TransportSpec::parse(&format!("raw://{addr}")).expect("plain spec");
+    assert!(!plain.reuse_port);
+    let err = bind(&plain, None)
+        .await
+        .expect_err("普通 bind 在同址同端口上必须失败，否则这条测试没有证明力");
+    let text = err.to_string();
+    assert!(
+        text.contains("地址") || text.contains("占用") || text.contains("Address"),
+        "错误要指向端口占用，实际是：{text}"
+    );
+}
+
 /// `decide_fallback` 的判定表（§8.5 场景 10 的决策面）。
 ///
 /// 三个分支对应三种运维现实：给了 `--report` 就转走；两边都没给就没有去处；

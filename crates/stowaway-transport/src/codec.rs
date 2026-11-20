@@ -696,18 +696,26 @@ pub fn listener_for(
     let nodelay = spec.nodelay;
     let keepalive = spec.keepalive_secs.map(std::time::Duration::from_secs);
     let path = spec.effective_path().to_owned();
+    let reuse_port = spec.reuse_port;
     let kcp_spec = spec.clone();
     Ok(Box::pin(async move {
         match kind {
             stowaway_protocol::TransportKind::Raw => {
                 #[cfg(feature = "transport-raw")]
                 {
-                    let l = crate::tcp::RawListener::bind(addr, tls, nodelay, keepalive).await?;
+                    // `reuse_port` 只在监听侧有意义（v1 `--rehost`）：规则模式下
+                    // iptables 负责改道，这里不做任何额外动作，两条路径互斥。
+                    let l = if reuse_port {
+                        crate::tcp::RawListener::bind_reuse_port(addr, tls, nodelay, keepalive)
+                            .await?
+                    } else {
+                        crate::tcp::RawListener::bind(addr, tls, nodelay, keepalive).await?
+                    };
                     Ok(crate::link::AnyListener::Raw(l))
                 }
                 #[cfg(not(feature = "transport-raw"))]
                 {
-                    let _ = (nodelay, keepalive);
+                    let _ = (nodelay, keepalive, reuse_port);
                     Err(TransportError::FeatureDisabled {
                         kind: "raw",
                         feature: "transport-raw",

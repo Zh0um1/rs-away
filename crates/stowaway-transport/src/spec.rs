@@ -119,6 +119,11 @@ pub struct TransportSpec {
     pub mtu: Option<u16>,
     /// kcp 的收发窗口。
     pub wnd: Option<(u16, u16)>,
+    /// 监听时是否启用 `SO_REUSEPORT`（v1 `--rehost`，plan §4.11）。
+    ///
+    /// 只有「本端要 bind」的一侧才有意义；拨号侧读到该字段不做任何事。
+    /// 默认 `false`，因此既有规格串的行为零变化。
+    pub reuse_port: bool,
 }
 
 impl TransportSpec {
@@ -174,6 +179,7 @@ impl TransportSpec {
             conv: None,
             mtu: None,
             wnd: None,
+            reuse_port: false,
         };
 
         // raw / kcp 不认路径：内联路径只对 ws 有意义，否则报错而非静默丢弃。
@@ -213,7 +219,7 @@ impl TransportSpec {
     fn apply_param(&mut self, key: &str, value: &str) -> Result<(), SpecError> {
         let scheme = self.kind.as_str();
         let allowed = match self.kind {
-            TransportKind::Raw => "nodelay、keepalive",
+            TransportKind::Raw => "nodelay、keepalive、reuse_port",
             TransportKind::Ws => "domain、path、nodelay、keepalive",
             TransportKind::Kcp => "conv、nodelay、mtu、wnd",
             TransportKind::Quic => "",
@@ -225,6 +231,12 @@ impl TransportSpec {
         match (self.kind, key) {
             (TransportKind::Raw | TransportKind::Ws, "nodelay") => {
                 self.nodelay = parse_bool(scheme, key, value)?;
+            }
+            (TransportKind::Raw, "reuse_port") => {
+                // 只有 raw 认这个参数：ws 的升级请求走的是同一条 TCP，
+                // 但「复用端口上的陌生流量」对 ws 没有可解释的语义
+                //（判成 ws 就说明对端真的是 HTTP），kcp 是 UDP 且无此选项。
+                self.reuse_port = parse_bool(scheme, key, value)?;
             }
             (TransportKind::Raw | TransportKind::Ws, "keepalive") => {
                 let secs: u64 = parse_u64(scheme, key, value)?;
@@ -525,6 +537,21 @@ mod tests {
             TransportSpec::parse("raw://h:1?bogus=1"),
             Err(SpecError::UnknownParam { .. })
         ));
+    }
+
+    #[test]
+    fn reuse_port_is_raw_only_and_off_by_default() {
+        // 默认关闭：既有规格串的行为必须零变化。
+        assert!(!TransportSpec::parse("raw://h:1").expect("raw").reuse_port);
+        assert!(
+            TransportSpec::parse("raw://h:1?reuse_port=1")
+                .expect("raw+reuse_port")
+                .reuse_port
+        );
+        // ws 上同一端口共享没有可解释的语义（判成 ws 就说明对端真的是 HTTP
+        // 升级请求），所以这一位只对 raw 开口。
+        assert!(TransportSpec::parse("ws://h:1?reuse_port=1").is_err());
+        assert!(TransportSpec::parse("kcp://h:1?reuse_port=1").is_err());
     }
 
     #[test]

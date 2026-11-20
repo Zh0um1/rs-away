@@ -73,7 +73,7 @@ p256 = "0.14.0"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 # 平台
-socket2 = "0.6.5"
+socket2 = { version = "0.6.5", features = ["all"] }
 nix = { version = "0.30", features = ["signal", "process"] }
 
 # 应用层

@@ -64,6 +64,9 @@ async fn main() -> anyhow::Result<()> {
         let outcome = match mode {
             cli::Mode::Active { .. } => run_active(&args, &upstream, upstream_kind, pin).await,
             cli::Mode::Passive { port } => run_passive(&args, &upstream, port).await,
+            cli::Mode::ReusePort { host, port } => {
+                run_passive_reuse(&args, &upstream, host, port).await
+            }
         };
         match outcome {
             Ok(()) => return Ok(()),
@@ -130,11 +133,14 @@ async fn run_passive(args: &cli::Args, upstream: &TransportSpec, port: u16) -> a
     spec.host = "0.0.0.0".to_owned();
     spec.port = port;
     let tls = server_tls(args)?;
-    let (mut listener, kind, addr) = stowaway_core::bind(&spec, tls.clone()).await?;
-    info!(%addr, kind = ?kind, "被动监听中");
 
     // 端口复用在**监听建立之后**装配：规则把复用端口上的 SYN 改道到本端口，
     // 而本端口必须先真的在听，否则改道过去只会得到 RST（plan §4.11）。
+    // 注意先 `install` 再 `bind` 也可以，但「听上了才改道」在失败时更容易
+    // 解释：装规则失败时端口仍然是通的。
+    let (mut listener, kind, addr) = stowaway_core::bind(&spec, tls.clone()).await?;
+    info!(%addr, kind = ?kind, "被动监听中");
+
     let reuse = install_port_reuse(args, port)?;
     let fallback = reuse
         .as_ref()
@@ -157,6 +163,61 @@ async fn run_passive(args: &cli::Args, upstream: &TransportSpec, port: u16) -> a
     // SIGINT/SIGTERM 时卸规则，`panic`/`abort` 一律留脏，属缺陷 #10 的一部分）。
     let _reuse_guard = reuse.map(ReuseGuard::new);
 
+    accept_loop(args, listener, kind, tls).await
+}
+
+/// `SO_REUSEPORT` 模式的被动监听（v1 的 `SOREUSE_PASSIVE`，`--rehost`）。
+///
+/// 与 [`run_passive`] 的差别有三处，且都是刻意的：
+///
+/// 1. **不需要 root、不碰 iptables**：靠 `SO_REUSEPORT` 让本进程与真实后端
+///    在同一个端口的**不同地址**上各自监听，内核按四元组把连接分开。因此
+///    这里完全不调用 `reuse::install`——那套规则是 iptables 模式的产物。
+/// 2. **回落目标是必然的**：`--rehost` 的语义就是「本进程只接本协议，其余
+///    转给 `127.0.0.1:<report>`」，所以这里不做 `decide_fallback` 的分支，
+///    直接把 `--report` 当回落目标（缺 `--report` 已在 `check_reuse` 报错）。
+/// 3. **监听地址来自 `--rehost`**（IP 字面量），不是 `0.0.0.0`。这正是它能
+///    与后端共存的原因：绑在 `0.0.0.0` 会和后端抢同一批连接（见
+///    [`stowaway_transport::tcp::RawListener::bind_reuse_port`] 的说明）。
+async fn run_passive_reuse(
+    args: &cli::Args,
+    upstream: &TransportSpec,
+    host: std::net::IpAddr,
+    port: u16,
+) -> anyhow::Result<()> {
+    let mut spec = upstream.clone();
+    spec.host = host.to_string();
+    spec.port = port;
+    // 这一位让 `listener_for` 走 `bind_reuse_port` 而不是普通 `bind`。
+    spec.reuse_port = true;
+    let tls = server_tls(args)?;
+
+    let (mut listener, kind, addr) = stowaway_core::bind(&spec, tls.clone()).await?;
+    let report = args.report.unwrap_or(0);
+    info!(
+        %addr,
+        kind = ?kind,
+        fallback = format!("127.0.0.1:{report}").as_str(),
+        "SO_REUSEPORT 被动监听中（非本协议流量转给回落目标）"
+    );
+    // 回落目标在复用模式下**必须**存在：`--rehost` 的全部意义就是「我只要
+    // 本协议，别的都给后端」。
+    listener = listener.with_fallback(Some(std::net::SocketAddr::from(([127, 0, 0, 1], report))));
+
+    accept_loop(args, listener, kind, tls).await
+}
+
+/// 被动模式下两边共用的接受循环。
+///
+/// 抽出来的理由：`Passive` 与 `ReusePort` 只在「监听怎么建立、回落目标从哪来」
+/// 上不同，从 `accept` 到 `serve` 这一段必须一模一样——否则两种模式下 admin
+/// 接入后的行为会分叉，而它们对 admin 来说本该是同一个 agent。
+async fn accept_loop(
+    args: &cli::Args,
+    mut listener: stowaway_transport::AnyListener,
+    kind: stowaway_protocol::TransportKind,
+    tls: Option<stowaway_transport::TlsConfig>,
+) -> anyhow::Result<()> {
     let expected_fp = tls.as_ref().and_then(|t| t.fingerprint()).map(|f| f.0);
     loop {
         let secret = load_secret(args)?;
@@ -176,7 +237,7 @@ async fn run_passive(args: &cli::Args, upstream: &TransportSpec, port: u16) -> a
         let peer = link.peer;
         if peer_kind != NodeKind::Admin {
             // 被动 agent 只等上游 admin；别的 agent 拨进来是「子节点」，
-            // 那条路径要共享已有运行时的编号分配器，属 `listen` 服务（P7）。
+            // 那条路径要共享已有运行时的编号分配器，属 `listen` 服务。
             warn!(peer = %peer, peer_kind = ?peer_kind, "非 admin 入站，忽略");
             continue;
         }
