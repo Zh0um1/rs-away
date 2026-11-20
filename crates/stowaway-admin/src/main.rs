@@ -118,10 +118,29 @@ async fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .and_then(stowaway_transport::TlsConfig::advertised_fingerprint);
             // 首个入站就绪后才进控制台，避免界面已起而拓扑还是空的。
-            let link = tokio::time::timeout(
-                LINK_SETUP_TIMEOUT,
-                stowaway_core::accept(&mut listener, kind, &secret, NodeKind::Admin, expected),
-            )
+            //
+            // 第一个连接失败**不算失败**：端口一旦对外，扫描器、健康检查、
+            // 浏览器预连接都会先撞上来。原先这里只 `accept` 一次，一次陌生
+            // 连接就把整个进程带走（`--non-interactive` 冒烟正是这样暴露的）。
+            // 现在只把「总时长」当条件，握手失败记日志后继续等。
+            let link = tokio::time::timeout(LINK_SETUP_TIMEOUT, async {
+                loop {
+                    match stowaway_core::accept(
+                        &mut listener,
+                        kind,
+                        &secret,
+                        NodeKind::Admin,
+                        expected,
+                    )
+                    .await
+                    {
+                        Ok(link) => return Ok::<_, anyhow::Error>(link),
+                        Err(e) => {
+                            tracing::warn!("首个入站握手失败，继续等待：{e}");
+                        }
+                    }
+                }
+            })
             .await
             .context("等待首个节点拨入超时（15 秒）")?
             .context("首个节点握手失败")?;
