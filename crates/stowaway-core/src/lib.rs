@@ -88,7 +88,9 @@ pub use udp_relay::{
     Datagram, MAX_UDP_DATAGRAM, UDP_IDLE_TIMEOUT_SECS, bind_outlet, needs_resolution,
     ready_message, relay_datagrams,
 };
-pub use udp_session::{UDP_FRAME_MAX, frame_datagram, outlet_side, read_datagram};
+pub use udp_session::{
+    UDP_FRAME_MAX, client_side_on, frame_datagram, outlet_side, outlet_side_on, read_datagram,
+};
 pub use upstream_proxy::{MAX_PROXY_RESPONSE, PROXY_DIAL_TIMEOUT, ProxySpec, dial_via_proxy};
 
 // P5 服务。`open_message` 在 backward / shell / ssh / bridge 各有一份，语义

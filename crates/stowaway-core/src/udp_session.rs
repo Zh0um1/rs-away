@@ -109,8 +109,13 @@ pub async fn frame_datagram<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) ->
             format!("UDP 帧载荷 {} 字节无法用 u16 表示", payload.len()),
         )
     })?;
-    w.write_all(&len.to_be_bytes()).await?;
-    w.write_all(payload).await?;
+    // 一次写完：`SessionStream` 的 `poll_write` 每次调用都会产生一条
+    // `SessionData`，分两次写就会让长度前缀和载荷各自成一条消息，接收端
+    // 看到的帧序列随之错位。分帧的原子性必须靠单次写来保证。
+    let mut frame = Vec::with_capacity(2 + payload.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(payload);
+    w.write_all(&frame).await?;
     Ok(())
 }
 
@@ -297,6 +302,84 @@ pub async fn outlet_side_on(
     }
 }
 
+/// 客户端侧（admin）：把 SOCKS5 客户端发来的数据报搬进会话流，再搬回客户端。
+///
+/// - 上行：`recv_from(客户端)` → 整包（含 SOCKS5 UDP 头）`frame_datagram` 进会话；
+///   出口侧负责解析头与发往目标，本端**不改写**载荷。
+/// - 下行：会话帧 → 原样 `send_to(客户端)`。帧里已经是完整的 SOCKS5 UDP 回包
+///   （出口侧把真实来源地址写进了头），本端再加一层只会让它认不出来。
+/// - **只服务第一个看到的客户端地址**：RFC 1928 §7 规定一条关联只对应一个
+///   客户端，接受第二个来源等于把别人的数据报塞进这条隧道。
+/// - 空闲 [`UDP_IDLE_TIMEOUT_SECS`] 秒无活动或会话 EOF → 收摊。
+///
+/// TCP 控制连接断开应由调用方监控（RFC 1928：关联随 TCP 连接结束），本函数
+/// 只负责数据面。
+///
+/// # Errors
+/// 会话读写出错、UDP 套接字出错。
+pub async fn client_side_on(
+    socket: UdpSocket,
+    session: SessionStream,
+    limit: usize,
+    idle: Duration,
+) -> Result<()> {
+    let mut session = session;
+    let mut buf = vec![0u8; limit.clamp(1, MAX_UDP_DATAGRAM)];
+    let mut chunk = vec![0u8; READ_CHUNK];
+    let mut pending: Vec<u8> = Vec::new();
+    let mut client: Option<SocketAddr> = None;
+    loop {
+        // 先吐已凑齐的帧（无 await，取消安全）。
+        while let Some(frame) = take_frame(&mut pending).map_err(udp_relay::as_core)? {
+            if frame.is_empty() {
+                continue;
+            }
+            let Some(addr) = client else {
+                continue;
+            };
+            socket
+                .send_to(&frame, addr)
+                .await
+                .map_err(udp_relay::as_core)?;
+        }
+
+        let round = tokio::time::timeout(idle, async {
+            tokio::select! {
+                got = session.read(&mut chunk) => Round::Upstream(got),
+                down = socket.recv_from(&mut buf) => Round::Downstream(down),
+            }
+        })
+        .await;
+
+        let Ok(round) = round else {
+            return Ok(());
+        };
+
+        match round {
+            Round::Upstream(Ok(0)) => return Ok(()),
+            Round::Upstream(Ok(n)) => pending.extend_from_slice(&chunk[..n]),
+            Round::Upstream(Err(e)) => return Err(udp_relay::as_core(e)),
+            Round::Downstream(Err(e)) => return Err(udp_relay::as_core(e)),
+            Round::Downstream(Ok((n, from))) => {
+                // RFC 1928 §7：一条关联只服务一个客户端。换来源就丢掉，
+                // 否则别人的数据报会被塞进这条隧道。
+                match client {
+                    None => client = Some(from),
+                    Some(known) if known != from => continue,
+                    Some(_) => {}
+                }
+                if n == 0 {
+                    continue;
+                }
+                frame_datagram(&mut session, &buf[..n])
+                    .await
+                    .map_err(udp_relay::as_core)?;
+                session.flush().await.map_err(udp_relay::as_core)?;
+            }
+        }
+    }
+}
+
 /// 一轮 `select` 的结果。
 #[derive(Debug)]
 enum Round {
@@ -405,6 +488,66 @@ mod tests {
             .await
             .expect_err("载荷不足必须报错");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn client_side_forwards_only_the_first_client_both_ways() {
+        let (session, sink, mut out) = session_stream();
+        let socket = bind_outlet("127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("bind");
+        let listen_addr = socket.local_addr().expect("addr");
+        let relay = tokio::spawn(client_side_on(
+            socket,
+            session,
+            65_535,
+            Duration::from_secs(5),
+        ));
+
+        // 第一个客户端发一包：上行必须是完整一帧，载荷原样保留。
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client");
+        client
+            .send_to(b"first-client", listen_addr)
+            .await
+            .expect("send");
+        let SessionOutbound::Data { data, .. } =
+            tokio::time::timeout(Duration::from_secs(2), out.recv())
+                .await
+                .expect("上行超时")
+                .expect("通道关闭")
+        else {
+            panic!("上行应该是数据帧");
+        };
+        assert_eq!(&data.data[..2], &[0x00, 0x0c], "长度前缀 = 载荷长度 12");
+        assert_eq!(&data.data[2..], b"first-client");
+
+        // 第二个客户端发一包：必须被丢掉（不回写会话）。
+        let other = UdpSocket::bind("127.0.0.1:0").await.expect("other");
+        other
+            .send_to(b"second-client", listen_addr)
+            .await
+            .expect("send");
+        let extra = tokio::time::timeout(Duration::from_millis(300), out.recv()).await;
+        assert!(extra.is_err(), "第二个来源不该被转发");
+
+        // 下行：会话帧原样送到第一个客户端（帧里已是完整 SOCKS5 回包）。
+        let mut wire: Vec<u8> = Vec::new();
+        frame_datagram(&mut wire, b"reply").await.expect("frame");
+        sink.send(SessionData {
+            key: key(),
+            seq: 0,
+            data: ByteBuf::from(wire),
+        })
+        .await
+        .expect("send downstream");
+        let mut down = [0u8; 8];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut down))
+            .await
+            .expect("recv")
+            .expect("ok");
+        assert_eq!(&down[..n], b"reply");
+
+        relay.abort();
     }
 
     #[tokio::test]
