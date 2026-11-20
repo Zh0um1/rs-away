@@ -532,7 +532,9 @@ fn defect_13_file_name_validation_blocks_escape() {
 #[test]
 fn defect_10_failed_rule_reports_step_and_rolls_back() {
     use std::cell::RefCell;
-    use stowaway_core::reuse::{CmdFailure, ReuseConfig, ReuseError, STEP_MARK_START, install_with};
+    use stowaway_core::reuse::{
+        CmdFailure, ReuseConfig, ReuseError, STEP_MARK_START, install_with,
+    };
 
     let log: RefCell<Vec<Vec<String>>> = RefCell::new(Vec::new());
     let injected = |argv: &[&str]| {
@@ -569,7 +571,10 @@ fn defect_10_failed_rule_reports_step_and_rolls_back() {
     let calls = log.borrow();
     let failed_at = calls
         .iter()
-        .rposition(|c| c.first().map(String::as_str) == Some("-A") && c.get(1).map(String::as_str) == Some("INPUT"))
+        .rposition(|c| {
+            c.first().map(String::as_str) == Some("-A")
+                && c.get(1).map(String::as_str) == Some("INPUT")
+        })
         .expect("应当有一次失败的 -A INPUT");
     let undo = &calls[failed_at + 1..];
     assert_eq!(undo.len(), 3, "该撤销 1 步 + 清链 + 删链，实际：{undo:?}");
@@ -580,7 +585,8 @@ fn defect_10_failed_rule_reports_step_and_rolls_back() {
     assert!(
         !undo
             .iter()
-            .any(|c| c.first().map(String::as_str) == Some("-D") && c.get(1).map(String::as_str) == Some("INPUT")),
+            .any(|c| c.first().map(String::as_str) == Some("-D")
+                && c.get(1).map(String::as_str) == Some("INPUT")),
         "从未成功的第 3 步不该出现在回滚里：{undo:?}"
     );
 }
