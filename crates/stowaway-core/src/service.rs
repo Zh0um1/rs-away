@@ -24,14 +24,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
+use stowaway_crypto::Secret;
 use stowaway_protocol::{
-    ConnectParam, FileDirection, FileParam, Message, NodeId, ServiceData, ServiceExit, ServiceKind,
-    ServiceParam, ServicePhase, ServiceReply, ServiceRequest, SessionCode, SessionKey, SessionKind,
-    ShellParam, SshParam, SshTunnelParam,
+    CloseReason, ConnectParam, FileDirection, FileParam, Message, NodeId, NodeKind, ServiceData,
+    ServiceExit, ServiceKind, ServiceParam, ServicePhase, ServiceReply, ServiceRequest,
+    SessionCode, SessionKey, SessionKind, ShellParam, SshParam, SshTunnelParam,
 };
+use stowaway_transport::{TlsConfig, TransportSpec};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::alloc::NodeIdAllocator;
+use crate::bridge::announce_message;
 use crate::engine::EngineHandle;
 use crate::error::{CoreError, Result};
 use crate::session_stream::SessionStream;
@@ -115,6 +120,87 @@ pub struct ServiceTask {
     pub handle: JoinHandle<()>,
 }
 
+/// `listen` 服务需要的运行时上下文。
+///
+/// 与其它服务不同，`listen` 不是「拿一条会话流搬字节」，而是在本机 **bind
+/// 一个新端口**并把拨进来的对端登记成自己的子节点（`agent/handler/listen.go`
+/// 的语义：本节点临时扮 admin，与 `bridge` 同一套握手）。这需要三样东西：
+/// 传输层规格、连线的密码学材料、以及一个**只属于本运行时**的编号分配器
+/// （编号必须由父节点分配，不能让对端自己编）。
+///
+/// 没有这份上下文时 `listen` 显式 `Denied`，而不是假装能监听——探测说
+/// 「可以」而执行说「没做」必须让调用方看得见（plan §4.14 E20）。
+pub struct ListenContext {
+    /// 连线密钥材料（握手与密封都要）。
+    pub secret: Arc<Secret>,
+    /// 要 bind 的传输层规格（`raw://0.0.0.0:9000` 之类）。
+    pub spec: TransportSpec,
+    /// 子节点编号分配器：`listen` 每接入一个对端就发一次号。
+    pub alloc: Mutex<NodeIdAllocator>,
+    /// 我的编号（也是子节点看到的 `parent`）。
+    pub me: NodeId,
+    /// 根节点编号（透传给子节点的 `JoinAck.root`）。
+    pub root: NodeId,
+    /// 我的深度（子节点是 `depth + 1`）。
+    pub depth: u16,
+    /// 上游节点编号；`None` 表示本节点就是根（没有上游可公告）。
+    pub upstream: Option<NodeId>,
+    /// 服务端 TLS 配置；`None` 表示明文。
+    pub tls: Option<TlsConfig>,
+}
+
+impl ListenContext {
+    /// 新建上下文。
+    #[must_use]
+    pub fn new(
+        secret: Arc<Secret>,
+        spec: TransportSpec,
+        alloc: NodeIdAllocator,
+        me: NodeId,
+        root: NodeId,
+        depth: u16,
+    ) -> Self {
+        Self {
+            secret,
+            spec,
+            alloc: Mutex::new(alloc),
+            me,
+            root,
+            depth,
+            upstream: None,
+            tls: None,
+        }
+    }
+
+    /// 带上上游节点编号（接入子节点后要向上游代子公告）。
+    #[must_use]
+    pub fn with_upstream(mut self, upstream: Option<NodeId>) -> Self {
+        self.upstream = upstream;
+        self
+    }
+
+    /// 带上服务端 TLS 配置。
+    #[must_use]
+    pub fn with_tls(mut self, tls: Option<TlsConfig>) -> Self {
+        self.tls = tls;
+        self
+    }
+}
+
+impl std::fmt::Debug for ListenContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `TlsConfig` 没有 `Debug`，`Secret` 的 `Debug` 已经脱敏；这里只打
+        // 能安全展开的部分，避免为了 derive 而给 `TlsConfig` 造一个假实现。
+        f.debug_struct("ListenContext")
+            .field("spec", &self.spec)
+            .field("me", &self.me)
+            .field("root", &self.root)
+            .field("depth", &self.depth)
+            .field("tls", &self.tls.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// 服务执行器：把引擎事件变成真实动作。
 #[derive(Clone, Debug)]
 pub struct Services {
@@ -123,6 +209,8 @@ pub struct Services {
     engine: EngineHandle,
     /// 会话目标（`OpenSession.target`，SSH / connect 用得上）。
     target: Option<String>,
+    /// `listen` 的运行时上下文（没装配时 `listen` 显式失败）。
+    listen: Option<Arc<ListenContext>>,
 }
 
 impl Services {
@@ -133,7 +221,18 @@ impl Services {
             config: Arc::new(config),
             engine,
             target: None,
+            listen: None,
         }
+    }
+
+    /// 带上 `listen` 的运行时上下文。
+    ///
+    /// 只有真正持有传输层与编号分配器的那一端（agent 的被动模式）才装配它；
+    /// 没装配时 `listen` 回 `Denied` 并给出原因。
+    #[must_use]
+    pub fn with_listen_context(mut self, ctx: ListenContext) -> Self {
+        self.listen = Some(Arc::new(ctx));
+        self
     }
 
     /// 带上会话目标（SSH 的 `host:port`、connect 的地址都在这）。
@@ -210,15 +309,32 @@ impl Services {
                     move |s| Box::pin(async move { s.run_connect(req.key, from, addr).await }),
                 )))
             }
-            // `listen` 与 `backward` 的 Run 阶段要装配新链路（共享编号分配器 + 传输层
-            // 监听），那是运行时职责而非服务职责；P6 只交付命令、参数校验与 Probe，
-            // 执行在 P7 联调阶段补（见 docs/plan.md §4.14 E17）。这里显式失败，
-            // 不静默成功——探测说「可以」而执行说「没做」必须让调用方看得见。
-            (ServicePhase::Run, kind @ (ServiceKind::Listen | ServiceKind::Backward)) => {
+            // `listen` 与 `backward` 的 Run 都要装配真实资源：`listen` 在本机
+            // bind 一个传输层端口把拨入者接成子节点，`backward` 在本机 bind
+            // 一个 TCP 监听口并逐连接向发起方要一条会话。
+            (ServicePhase::Run, ServiceKind::Listen) => {
+                let Some(ctx) = self.listen.clone() else {
+                    let detail =
+                        "本进程没有装配监听上下文（listen 需要传输层与编号分配器）".to_owned();
+                    self.reply(req.key, from, SessionCode::Denied, &detail)
+                        .await;
+                    return Ok(None);
+                };
+                Ok(Some(self.spawn(
+                    req.key,
+                    from,
+                    ServiceKind::Listen,
+                    move |s| Box::pin(async move { s.run_listen(req.key, from, ctx).await }),
+                )))
+            }
+            (ServicePhase::Run, ServiceKind::Backward) => {
                 let addr = connect_addr(&req.param)?;
-                Ok(Some(self.spawn(req.key, from, kind, move |s| {
-                    Box::pin(async move { s.run_deferred(req.key, from, kind, addr).await })
-                })))
+                Ok(Some(self.spawn(
+                    req.key,
+                    from,
+                    ServiceKind::Backward,
+                    move |s| Box::pin(async move { s.run_backward(req.key, from, addr).await }),
+                )))
             }
         }
     }
@@ -299,21 +415,190 @@ impl Services {
         }
     }
 
+    /// 回一条 `ServiceReply`（`listen`/`backward` 这类「先告诉对端我起没起来」的
+    /// 服务用它，而不是 `SessionReady`：它们的首个答复是「监听成功/失败」，
+    /// 与某条会话无关，见 `docs/plan.md` 附录 A 第 13、26 行）。
+    async fn reply(&self, key: SessionKey, from: NodeId, code: SessionCode, detail: &str) {
+        let reply = Message::ServiceReply(ServiceReply {
+            key,
+            code,
+            detail: detail.to_owned(),
+        });
+        if let Err(e) = self.engine.send(reply, from).await {
+            tracing::warn!("把 {} 送回去失败：{e}", code_tag(code));
+        }
+    }
+
     // —— 各服务 ——
 
-    /// `listen` / `backward` 的执行体（P6 显式拒绝，见 [`Self::handle`] 的注释）。
-    async fn run_deferred(
-        &self,
-        key: SessionKey,
-        from: NodeId,
-        kind: ServiceKind,
-        addr: String,
-    ) -> Outcome {
-        let _ = (key, from);
-        Outcome::failed(
-            SessionCode::Refused,
-            format!("{kind:?} 的执行尚未接通（{addr}）：P6 只交付命令与探测，见 plan §4.14 E17"),
+    /// `listen`：在本机 bind 一个传输层端口，把拨进来的对端接成子节点。
+    ///
+    /// 与 `bridge` 同一套握手：本端临时扮 admin，对端扮 agent 申领编号。
+    /// 编号只能由父节点分配，所以这里必然走 [`crate::bootstrap::assign_id`]；
+    /// 接入成功后向上游补一条 `Join{node: <child>}` 代子公告，否则上游不知道
+    /// 多了一个孙节点（plan §4.7）。
+    async fn run_listen(&self, key: SessionKey, from: NodeId, ctx: Arc<ListenContext>) -> Outcome {
+        let _ = from;
+        let (mut listener, kind, addr) =
+            match crate::runtime::bind(&ctx.spec, ctx.tls.clone()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    let detail = format!("{} 监听失败：{e}", ctx.spec);
+                    self.reply(key, from, SessionCode::Denied, &detail).await;
+                    return Outcome::failed(SessionCode::Denied, detail);
+                }
+            };
+        self.reply(
+            key,
+            from,
+            SessionCode::Ok,
+            &format!("已在 {addr} 监听（{kind:?}）"),
         )
+        .await;
+        let expected = ctx.tls.as_ref().and_then(TlsConfig::advertised_fingerprint);
+        loop {
+            let link = match crate::runtime::accept(
+                &mut listener,
+                kind,
+                &ctx.secret,
+                NodeKind::Admin,
+                expected,
+            )
+            .await
+            {
+                Ok(link) => link,
+                Err(e) => {
+                    // 单次握手失败不该拖垮监听（v1 在这里直接 return，端口就此失守）。
+                    tracing::warn!("{addr} 入站握手失败，继续监听：{e}");
+                    continue;
+                }
+            };
+            let mut codec = link.codec;
+            // 分配编号：锁内只推进状态，`await` 都在锁外（迁移/接入都可能等很久）。
+            let assigned = {
+                let mut guard = ctx.alloc.lock().await;
+                crate::bootstrap::assign_id(&mut codec, &mut guard, ctx.me, ctx.root, ctx.depth)
+                    .await
+            };
+            let (child, _join) = match assigned {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("{addr} 接入失败（入网引导）：{e}");
+                    continue;
+                }
+            };
+            if let Some(upstream) = ctx.upstream {
+                // 代子公告：让所有上游知道这个孙节点（引擎收到 `Join{node}` 会自登记）。
+                if let Err(e) = self
+                    .engine
+                    .send(announce_message(child, NodeKind::Agent), upstream)
+                    .await
+                {
+                    tracing::warn!("向上游 {upstream} 公告 {child} 失败：{e}");
+                }
+            }
+            if let Err(e) = self
+                .engine
+                .attach_link(codec, child, ctx.me, NodeKind::Agent)
+                .await
+            {
+                tracing::warn!("把 {child} 挂上链路失败：{e}");
+                continue;
+            }
+            tracing::info!("{addr} 已接入子节点 {child}");
+        }
+    }
+
+    /// `backward`：在本机 bind 一个 TCP 端口，每条进来连接向发起方要一条会话。
+    ///
+    /// 与 forward 相反：forward 是「本端监听、数据往外送」，backward 是
+    /// 「本端监听、每条连接另开一条会话由对端拨回目标」（v1 `BACKWARDSTART`
+    /// 的语义）。`ServiceParam` 里带的是**监听端口**（`listen:<port>`）。
+    async fn run_backward(&self, key: SessionKey, from: NodeId, addr: String) -> Outcome {
+        let port = match backward_port(&addr) {
+            Ok(p) => p,
+            Err(e) => {
+                let detail = e.to_string();
+                self.reply(key, from, SessionCode::Denied, &detail).await;
+                return Outcome::failed(SessionCode::Denied, detail);
+            }
+        };
+        let spec = crate::backward::BackwardSpec::new(key, port, String::new());
+        let mut listener = match crate::backward::BackwardListener::bind(&spec).await {
+            Ok(l) => l,
+            Err(e) => {
+                let detail = format!("反向映射监听 {port} 失败：{e}");
+                self.reply(key, from, SessionCode::Denied, &detail).await;
+                return Outcome::failed(SessionCode::Denied, detail);
+            }
+        };
+        let bind_addr = listener.local_addr();
+        self.reply(
+            key,
+            from,
+            SessionCode::Ok,
+            &format!("已在 {bind_addr} 监听（反向映射）"),
+        )
+        .await;
+        let mut conns = 0u64;
+        loop {
+            let (mut stream, conn_key, open) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("{bind_addr} 接受连接失败，继续监听：{e}");
+                    continue;
+                }
+            };
+            conns = conns.saturating_add(1);
+            // 每条连接独立会话：共用键会让同一条链路上建立的多条连接互相覆盖
+            // （v1 的「一次一条连接」是真限制，v2 用 `SessionKey{origin,id}` 消歧，E8）。
+            if let Err(e) = self
+                .engine
+                .register_session(conn_key, SessionKind::Backward)
+                .await
+            {
+                tracing::warn!("反向连接 {conn_key:?} 登记失败：{e}");
+                continue;
+            }
+            if let Err(e) = self.engine.send(open, from).await {
+                tracing::warn!("反向连接 {conn_key:?} 通知发起方失败：{e}");
+                continue;
+            }
+            let mut session = match self.stream(conn_key, from, SessionKind::Backward).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("反向连接 {conn_key:?} 开会话流失败：{e}");
+                    continue;
+                }
+            };
+            match self.engine.await_ready(conn_key).await {
+                Ok(SessionCode::Ok) => {}
+                Ok(code) => {
+                    tracing::warn!("反向连接 {conn_key:?} 被拒绝：{}", code_tag(code));
+                    self.engine
+                        .close_session(conn_key, CloseReason::Refused)
+                        .await
+                        .ok();
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("反向连接 {conn_key:?} 等就绪失败：{e}");
+                    continue;
+                }
+            }
+            // 中继在独立任务里跑：一条连接慢不该阻塞下一条连接进来。
+            let engine = self.engine.clone();
+            tokio::spawn(async move {
+                match crate::backward::relay_backward(&mut session, &mut stream).await {
+                    Ok(bytes) => tracing::debug!("反向连接 {conn_key:?} 结束：{bytes:?}"),
+                    Err(e) => tracing::warn!("反向连接 {conn_key:?} 中继中断：{e}"),
+                }
+                engine
+                    .close_session(conn_key, CloseReason::Normal)
+                    .await
+                    .ok();
+            });
+        }
     }
 
     async fn run_connect(&self, key: SessionKey, from: NodeId, addr: String) -> Outcome {
@@ -944,9 +1229,26 @@ pub fn parse_listen_addr(input: &str) -> Result<SocketAddr> {
         .map_err(|_| bad_param(format!("监听地址非法：{input}")))
 }
 
+/// 从 `listen:<port>`（`BackwardSpec` 的约定载荷）或裸端口里取出监听端口。
+///
+/// backward 的 `ConnectParam.addr` 不是目标地址而是**本端要监听的端口**
+/// （v1 `BACKWARDTEST` 带的是 `RPort`），所以这里只认 `listen:` 前缀与纯数字，
+/// 其余一律报错——把 `1.2.3.4:80` 当成监听端口的后果是静默监听在 80 上。
+pub fn backward_port(input: &str) -> Result<u16> {
+    let raw = input.trim();
+    let raw = raw.strip_prefix("listen:").unwrap_or(raw);
+    let port: u16 = raw
+        .parse()
+        .map_err(|_| bad_param(format!("backward 的监听端口非法：{input}")))?;
+    if port == 0 {
+        return Err(bad_param("backward 的监听端口不能是 0"));
+    }
+    Ok(port)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Outcome, Outcome as _O, parse_listen_addr, split_target};
+    use super::{Outcome, Outcome as _O, backward_port, parse_listen_addr, split_target};
     use stowaway_protocol::{NodeId, SessionCode, SessionKey};
 
     #[test]
@@ -990,6 +1292,45 @@ mod tests {
             "127.0.0.1:1080"
         );
         assert!(parse_listen_addr("not-a-port").is_err());
+    }
+
+    #[test]
+    fn backward_port_accepts_listen_prefix_and_bare_port() {
+        assert_eq!(backward_port("listen:9000").expect("ok"), 9000);
+        assert_eq!(backward_port("9000").expect("ok"), 9000);
+        assert_eq!(backward_port("  listen:1 ").expect("ok"), 1);
+        assert!(
+            backward_port("127.0.0.1:9000").is_err(),
+            "backward 的载荷是监听端口，把目标地址当端口必须报错而不是静默取 127"
+        );
+        assert!(backward_port("listen:0").is_err(), "端口 0 无处可听");
+        assert!(backward_port("listen:not-a-port").is_err());
+    }
+
+    #[test]
+    fn listen_context_debug_does_not_leak_the_secret() {
+        use super::ListenContext;
+        use crate::alloc::NodeIdAllocator;
+        use std::sync::Arc;
+        let secret = Arc::new(stowaway_crypto::Secret::load("listen-ctx-secret", 8).expect("ok"));
+        let ctx = ListenContext::new(
+            secret,
+            stowaway_transport::TransportSpec::parse("raw://127.0.0.1:0").expect("spec"),
+            NodeIdAllocator::new([1, 2, 3, 4]),
+            NodeId::ADMIN,
+            NodeId::ADMIN,
+            0,
+        );
+        let shown = format!("{ctx:?}");
+        assert!(shown.contains("ListenContext"), "要能认出类型：{shown}");
+        assert!(
+            !shown.contains("listen-ctx-secret"),
+            "Debug 绝不能把密钥打出来：{shown}"
+        );
+        assert!(
+            shown.contains("tls: false"),
+            "明文时 tls 必须是 false：{shown}"
+        );
     }
 
     #[test]
