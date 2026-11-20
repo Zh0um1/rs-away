@@ -233,6 +233,22 @@ impl Args {
         Ok(Some(fp.0))
     }
 
+    /// 上游代理规格（`--socks5-proxy` 与 `--http-proxy` 至多一个，clap 已保证）。
+    ///
+    /// 地址的 `host:port` 校验留到 [`stowaway_core::dial_through_proxy`] 里做：
+    /// 这里是**取值**，不是**校验**——同一份 `split_host_port` 只该有一处，
+    /// 否则两处判定分叉时，用户会看到「启动时说合法、拨号时说非法」。
+    #[must_use]
+    pub fn proxy_spec(&self) -> Option<stowaway_core::ProxySpec> {
+        let user = || self.socks5_proxy_user.clone().unwrap_or_default();
+        let pass = || self.socks5_proxy_pass.clone().unwrap_or_default();
+        match (&self.socks5_proxy, &self.http_proxy) {
+            (Some(addr), _) => Some(stowaway_core::ProxySpec::socks5(addr, user(), pass())),
+            (None, Some(addr)) => Some(stowaway_core::ProxySpec::http(addr, user(), pass())),
+            (None, None) => None,
+        }
+    }
+
     /// 代理凭据必须成对。
     ///
     /// # Errors

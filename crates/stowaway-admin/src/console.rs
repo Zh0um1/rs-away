@@ -37,6 +37,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -1632,7 +1633,7 @@ async fn udp_associate(
     peer: NodeId,
 ) {
     // 入口绑在回环上：这条入口只服务本机客户端，暴露到外网等于开一个开放中继。
-    let socket = match bind_outlet("0.0.0.0:0".parse().expect("回环地址是常量")).await {
+    let socket = match bind_outlet(SocketAddr::from(([0, 0, 0, 0], 0))).await {
         Ok(s) => s,
         Err(_) => {
             let reply = socks::Reply::new(socks::REP_GENERAL_FAILURE);

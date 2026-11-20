@@ -14,8 +14,8 @@ use clap::Parser;
 use stowaway_admin::render;
 use stowaway_admin::{cli, command, console};
 use stowaway_core::{
-    Engine, Event, HeartbeatConfig, Link, NodeConfig, NodeIdAllocator, bind, dial, lead,
-    salt_from_secret,
+    Engine, Event, HeartbeatConfig, Link, NodeConfig, NodeIdAllocator, bind, dial,
+    dial_through_proxy, lead, salt_from_secret,
 };
 use stowaway_crypto::{CertFingerprint, Secret};
 use stowaway_protocol::{NodeId, NodeKind};
@@ -51,9 +51,6 @@ async fn main() -> anyhow::Result<()> {
         non_interactive = args.non_interactive,
         "stowaway-admin 启动"
     );
-    if args.via_proxy() {
-        tracing::warn!("上游代理已解析但尚未接入拨号路径（P7 联调项）");
-    }
     if args.tls && pin.is_none() && !args.tls_tofu {
         tracing::warn!("TLS 未给 `--tls-pin` 也未开 `--tls-tofu`：将按 TOFU 首次信任");
     }
@@ -92,13 +89,21 @@ async fn main() -> anyhow::Result<()> {
                 tls: client_tls(&args, pin),
             };
             tracing::info!(%addr, "主动拨号");
-            let link = tokio::time::timeout(
-                LINK_SETUP_TIMEOUT,
-                dial(&upstream, &target, NodeKind::Admin, &secret),
-            )
-            .await
-            .context("拨号超时（15 秒）")?
-            .context("拨号失败")?;
+            let proxy = args.proxy_spec();
+            let dial_fut = async {
+                match &proxy {
+                    Some(proxy) => {
+                        tracing::info!(%proxy, "经上游代理拨号");
+                        dial_through_proxy(&upstream, &target, proxy, NodeKind::Admin, &secret)
+                            .await
+                    }
+                    None => dial(&upstream, &target, NodeKind::Admin, &secret).await,
+                }
+            };
+            let link = tokio::time::timeout(LINK_SETUP_TIMEOUT, dial_fut)
+                .await
+                .context("拨号超时（15 秒）")?
+                .context("拨号失败")?;
             establish(&handle, link, &mut alloc).await?;
         }
         cli::Mode::Passive { port } => {

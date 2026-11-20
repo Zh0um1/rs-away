@@ -7,6 +7,7 @@
 mod cli;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,14 +58,6 @@ async fn main() -> anyhow::Result<()> {
         tls = args.tls,
         "stowaway-agent 启动"
     );
-    if args.socks5_proxy.is_some() || args.http_proxy.is_some() {
-        // 上游代理尚未接进链路建立路径（P7 项），显式告知而不是静默忽略。
-        warn!(
-            socks5 = ?args.socks5_proxy,
-            http = ?args.http_proxy,
-            "上游代理已解析但尚未接入拨号路径（P7 联调项）"
-        );
-    }
 
     let reconnect = args.reconnect;
     loop {
@@ -100,7 +93,14 @@ async fn run_active(
         tls: client_tls(args, pin),
     };
     let secret = load_secret(args)?;
-    let link = stowaway_core::dial(upstream, &target, NodeKind::Agent, &secret).await?;
+    let link = match args.proxy_spec() {
+        Some(proxy) => {
+            info!(proxy = %proxy, "经上游代理拨号");
+            stowaway_core::dial_through_proxy(upstream, &target, &proxy, NodeKind::Agent, &secret)
+                .await?
+        }
+        None => stowaway_core::dial(upstream, &target, NodeKind::Agent, &secret).await?,
+    };
     let peer_kind = link.handshake.peer_kind;
     let peer = link.peer;
     info!(peer = %peer, peer_kind = ?peer_kind, kind = ?kind, "上行已建立");
@@ -378,7 +378,7 @@ async fn spawn_udp_outlet(
     key: SessionKey,
     from: NodeId,
 ) -> Option<ServiceTask> {
-    let socket = match bind_outlet("0.0.0.0:0".parse().expect("回环地址是常量")).await {
+    let socket = match bind_outlet(SocketAddr::from(([0, 0, 0, 0], 0))).await {
         Ok(s) => s,
         Err(e) => {
             warn!(key = ?key, error = %e, "UDP 出口无法绑定");
