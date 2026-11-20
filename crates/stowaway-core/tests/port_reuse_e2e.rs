@@ -73,7 +73,7 @@ fn secret() -> Secret {
 /// 字节吞掉（v1 的 `io.ReadFull` 就得手动补发），后端那条断言会失败；若监听器
 /// 在陌生连接上直接报错退出，第二条连接的握手就永远等不到 `accept`。
 #[tokio::test]
-async fn foreign_traffic_is_proxied_and_protocol_traffic_still_handshakes() {
+async fn scenario_10_foreign_traffic_is_proxied_and_protocol_traffic_handshakes() {
     let (backend, hits) = spawn_backend().await;
     let (listener, kind, local) = bind(&spec_for("127.0.0.1:0".parse().expect("addr")), None)
         .await
@@ -153,7 +153,7 @@ async fn foreign_traffic_is_proxied_and_protocol_traffic_still_handshakes() {
 /// `install_port_reuse` 就是不设 fallback，此时调用方必须看到明确错误
 /// （`TransportError::ReuseFallback`），而不是一个永远不返回的 `accept`。
 #[tokio::test]
-async fn without_fallback_foreign_traffic_is_a_loud_error() {
+async fn scenario_10_without_fallback_foreign_traffic_is_a_loud_error() {
     let (listener, kind, local) = bind(&spec_for("127.0.0.1:0".parse().expect("addr")), None)
         .await
         .expect("listen");

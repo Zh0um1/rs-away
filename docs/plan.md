@@ -713,6 +713,28 @@ v2 **不读** v1 配置与持久化格式。迁移动作：重新生成 `--reuse
 
 附加：**跨传输混跑**（上行 `ws`、子链路 `kcp`）、TLS 降级必须失败（篡改 `transport_kind` 后握手应失败）。
 
+**场景 → 测试对照表**（`grep -r "fn scenario_" crates/*/tests/` 可一次列全；测试名以场景号开头，
+所以「哪个场景没有测试」是机械可见的）：
+
+| # | 测试函数 | 所在文件 |
+|---|---|---|
+| 1 | `scenario_1_socks5_tcp_punch_through` | `crates/stowaway-core/tests/services_e2e.rs` |
+| 2 | `scenario_2_two_hop_socks5_punch_through` | 同上 |
+| 3 | `scenario_3a_forward_probe_success_then_commit_binds_port`、`scenario_3b_forward_probe_failure_reports_peer_code` | 同上 |
+| 4 | `scenario_4a_backward_listens_then_relays`、`scenario_4b_backward_stop_releases_port` | 同上 |
+| 5 | `scenario_5_file_transfer_rejects_traversal` + `upload_direction_moves_bytes_and_the_receiver_verifies_the_digest`、`download_direction_sends_a_manifest_then_the_bytes` | 同上 + `file_transfer_e2e.rs` |
+| 6 | `scenario_6_udp_associate_agent_initiates` + `udp_associate_relays_a_datagram_round_trip` | 同上 + `udp_associate_e2e.rs` |
+| 7 | `scenario_7a_shell_interactive_output`、`scenario_7b_resize_reaches_the_child` | `crates/stowaway-core/tests/p5_e2e.rs` |
+| 8 | `scenario_8a_ssh_command_execution`、`scenario_8b_ssh_tunnel_carries_tcp` | 同上 |
+| 9 | `scenario_9_connect_bridge_registers_peer` | 同上 |
+| 10 | `scenario_10_foreign_traffic_is_proxied_and_protocol_traffic_handshakes`、`scenario_10_without_fallback_foreign_traffic_is_a_loud_error` | `crates/stowaway-core/tests/port_reuse_e2e.rs` |
+| 附加·混跑 | `ws_upstream_and_kcp_child_link_share_one_tree` | `crates/stowaway-core/tests/mixed_transport_e2e.rs`（需 `--features transport-kcp`） |
+| 附加·TLS 降级 | `tls_*`（7 条） | `crates/stowaway-core/tests/tls_downgrade_e2e.rs` |
+| `--non-interactive` 冒烟 | `cargo xtask smoke` | `xtask/src/smoke.rs`（两个真二进制、跨进程） |
+
+场景 7/8 依赖外部程序（`/usr/sbin/sshd`、`/usr/bin/ssh-keygen`），缺失时测试**打印原因并跳过**；
+其余场景全部自包含（本机 `iptables`、本机回环 socket）。
+
 ### 8.6 DoD（硬性、机械可验）
 
 ```bash
