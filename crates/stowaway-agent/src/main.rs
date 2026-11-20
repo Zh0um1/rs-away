@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use stowaway_core::reuse;
 use stowaway_core::{
     EngineHandle, Event, HeartbeatConfig, ListenContext, MAX_UDP_DATAGRAM, NodeConfig, Runtime,
     RuntimeConfig, ServiceConfig, ServiceTask, Services, UDP_IDLE_TIMEOUT_SECS, bind_outlet,
@@ -39,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
     // 那时已经 bind 过端口、发过握手（plan §6「解析期报冲突项」）。
     let mode = args.mode()?;
     args.check_proxy_credentials()?;
+    args.check_reuse()?;
     let pin = args.tls_pin()?;
     let upstream = args.upstream_spec()?;
     let upstream_kind = args.upstream_kind()?;
@@ -61,12 +63,6 @@ async fn main() -> anyhow::Result<()> {
             socks5 = ?args.socks5_proxy,
             http = ?args.http_proxy,
             "上游代理已解析但尚未接入拨号路径（P7 联调项）"
-        );
-    }
-    if args.reuse_magic.is_some() {
-        warn!(
-            magic = ?args.reuse_magic,
-            "端口复用魔法串已解析，但复用监听属 P7 项（plan §4.11）"
         );
     }
 
@@ -136,6 +132,30 @@ async fn run_passive(args: &cli::Args, upstream: &TransportSpec, port: u16) -> a
     let tls = server_tls(args)?;
     let (mut listener, kind, addr) = stowaway_core::bind(&spec, tls.clone()).await?;
     info!(%addr, kind = ?kind, "被动监听中");
+
+    // 端口复用在**监听建立之后**装配：规则把复用端口上的 SYN 改道到本端口，
+    // 而本端口必须先真的在听，否则改道过去只会得到 RST（plan §4.11）。
+    let reuse = install_port_reuse(args, port)?;
+    let fallback = reuse
+        .as_ref()
+        .and_then(|cfg| match reuse::decide_fallback(cfg, args.report) {
+            reuse::Fallback::Report(target) => {
+                Some(std::net::SocketAddr::from(([127, 0, 0, 1], target)))
+            }
+            reuse::Fallback::Reuse => None,
+            reuse::Fallback::Reject(why) => {
+                // 规则装上了却没有回落目标：陌生流量会被 REDIRECT 到本端口，
+                // 而本端口会把它当成握手失败丢掉。这是装得上但不好用的状态，
+                // 必须说出来而不是留给人自己发现。
+                warn!(why, "端口复用已装规则，但没有可用的回落目标");
+                None
+            }
+        });
+    listener = listener.with_fallback(fallback);
+    // 规则的生命周期与本进程绑定：退出时卸掉，否则 iptables 里会留下指向
+    // 一个已经没人监听的端口的规则，之后的连接全被黑洞掉（v1 只在收到
+    // SIGINT/SIGTERM 时卸规则，`panic`/`abort` 一律留脏，属缺陷 #10 的一部分）。
+    let _reuse_guard = reuse.map(ReuseGuard::new);
 
     let expected_fp = tls.as_ref().and_then(|t| t.fingerprint()).map(|f| f.0);
     loop {
@@ -270,6 +290,71 @@ async fn serve(runtime: Runtime, args: &cli::Args, ack: &JoinAck) -> anyhow::Res
         rt.shutdown().await.ok();
     }
     Ok(())
+}
+
+/// 端口复用规则的清理守卫：Drop 时卸掉本进程装的规则。
+///
+/// 用 Drop 而不是 `atexit`/信号钩子：前者对正常返回、`?` 提前返回、任务被
+/// `abort` 都成立，信号钩子只能覆盖最后一种。
+struct ReuseGuard(reuse::ReuseConfig);
+
+impl ReuseGuard {
+    const fn new(cfg: reuse::ReuseConfig) -> Self {
+        Self(cfg)
+    }
+}
+
+impl Drop for ReuseGuard {
+    fn drop(&mut self) {
+        match reuse::uninstall(&self.0) {
+            Ok(()) => info!(chain = %self.0.chain, "端口复用规则已卸"),
+            Err(e) => warn!(chain = %self.0.chain, error = %e, "端口复用规则卸载失败"),
+        }
+    }
+}
+
+/// 按 `--reuse-magic` / `--report` 装端口复用规则（plan §4.11）。
+///
+/// 三个开关缺一不可：`--reuse-magic` 给标记、`--report` 给回落目标、`-l`
+/// 给本端监听端口。少了任何一个都不装规则，且**只在给了 `--reuse-magic` 时
+/// 才报错**（其余情况是「没用这个功能」，不是配置错误）。
+///
+/// `--allow-degraded` 的作用只有一处：规则装不上时继续跑（只是没有复用），
+/// 否则按 plan §4.11 的要求带着原因退出——静默降级会让运维以为复用生效了。
+fn install_port_reuse(
+    args: &cli::Args,
+    local_port: u16,
+) -> anyhow::Result<Option<reuse::ReuseConfig>> {
+    let Some(magic) = args.reuse_magic.as_deref() else {
+        return Ok(None);
+    };
+    let Some(reused_port) = args.report else {
+        return Err(anyhow::anyhow!(
+            "`--reuse-magic` 需要同时给出 `--report <port>`（非本协议流量的回落目标）"
+        ));
+    };
+    let cfg = match reuse::ReuseConfig::new(magic, reused_port, local_port) {
+        Ok(c) => c,
+        Err(e) => return Err(anyhow::anyhow!("端口复用配置无效：{e}")),
+    };
+    match reuse::install(&cfg) {
+        Ok(_) => {
+            info!(
+                chain = %cfg.chain,
+                reused_port = cfg.reused_port,
+                local_port = cfg.local_port,
+                "端口复用规则已装"
+            );
+            Ok(Some(cfg))
+        }
+        Err(e) if args.allow_degraded => {
+            warn!(error = %e, "端口复用规则装不上，按 --allow-degraded 降级继续");
+            Ok(None)
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "端口复用规则安装失败（加 --allow-degraded 可降级运行）：{e}"
+        )),
+    }
 }
 
 /// 运行时配置（节点编号留空：被动/主动都靠 `follow` 从父节点领取）。

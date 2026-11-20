@@ -144,6 +144,26 @@ impl AnyListener {
     }
 }
 
+impl AnyListener {
+    /// 设置端口复用回落目标（plan §4.11）。
+    ///
+    /// 只有 `raw` 支持回落：`ws`/`kcp` 上的陌生流量回落成什么协议都没有意义
+    /// （`sniff::classify` 判成 `Ws` 就说明它确实是 HTTP 升级请求，接错端口该
+    /// 回 400，不该转给后端——那是 [`crate::tcp`] 里已写明的判断），而 `kcp` 是
+    /// 数据报，没有「一条流」可转。所以非 `raw` 变体上是**静默空操作**：调用方
+    /// 无需按 feature 分支，但也不会得到它不支持的语义。
+    ///
+    /// 传 `None` 恢复「返回 [`TransportError::ReuseFallback`] 由调用方决定」。
+    #[must_use]
+    pub fn with_fallback(self, target: Option<SocketAddr>) -> Self {
+        match self {
+            #[cfg(feature = "transport-raw")]
+            Self::Raw(l) => Self::Raw(l.with_fallback(target)),
+            other => other,
+        }
+    }
+}
+
 impl Listener for AnyListener {
     fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {

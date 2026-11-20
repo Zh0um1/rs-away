@@ -134,14 +134,6 @@ pub struct Args {
     #[arg(long, conflicts_with = "socks5_proxy")]
     pub http_proxy: Option<String>,
 
-    /// 端口复用的魔法串。
-    #[arg(long)]
-    pub reuse_magic: Option<String>,
-
-    /// 端口复用回落端口。
-    #[arg(long)]
-    pub report: Option<u16>,
-
     /// 允许长度不足 8 字节的弱密钥（仅调试）。
     #[arg(long)]
     pub allow_weak_secret: bool,

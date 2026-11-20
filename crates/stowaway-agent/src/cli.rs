@@ -210,6 +210,12 @@ pub enum ArgsError {
     /// 只给了一个代理凭据。
     #[error("`--socks5-proxy-user` 与 `--socks5-proxy-pass` 必须成对使用")]
     HalfProxyCredentials,
+    /// 端口复用参数组合不成立。
+    #[error("端口复用配置不成立：{reason}")]
+    BadReuse {
+        /// 原因。
+        reason: String,
+    },
 }
 
 impl Args {
@@ -313,6 +319,59 @@ impl Args {
     pub fn check_proxy_credentials(&self) -> Result<(), ArgsError> {
         if self.socks5_proxy_user.is_some() != self.socks5_proxy_pass.is_some() {
             return Err(ArgsError::HalfProxyCredentials);
+        }
+        Ok(())
+    }
+
+    /// 端口复用参数的组合校验（plan §4.11）。
+    ///
+    /// 三件事在这里定下来，而不是等到 `run_passive` 里装规则时才报：
+    /// ① `--reuse-magic` 与 `--report` **必须成对**——只给 magic 就没有回落
+    /// 目标（陌生流量被 REDIRECT 过来会被当成握手失败丢掉），只给 report 则
+    /// 没有规则把流量引来；② magic 必须正好 16 字符；③ 复用只对**被动 raw**
+    /// 有意义——主动模式下本端不监听，`--reuse-magic` 无从生效，而 `ws`/`kcp`
+    /// 上没有被 REDIRECT 的 TCP 流量，配了也是空转。
+    ///
+    /// # Errors
+    /// 组合非法时返回 [`ArgsError::BadReuse`]。
+    pub fn check_reuse(&self) -> Result<(), ArgsError> {
+        let has_magic = self.reuse_magic.is_some();
+        let has_report = self.report.is_some();
+        if !has_magic && !has_report {
+            return Ok(());
+        }
+        let fail = |reason: String| Err(ArgsError::BadReuse { reason });
+        if has_magic != has_report {
+            return fail(
+                "`--reuse-magic` 与 `--report` 必须成对给出（前者是标记，后者是非本协议流量的回落目标）"
+                    .to_owned(),
+            );
+        }
+        let Some(magic) = self.reuse_magic.as_deref() else {
+            return Ok(());
+        };
+        if magic.chars().count() != stowaway_core::reuse::REUSE_MAGIC_LEN {
+            return fail(format!(
+                "`--reuse-magic` 必须正好 {} 个字符，当前是 {}",
+                stowaway_core::reuse::REUSE_MAGIC_LEN,
+                magic.chars().count()
+            ));
+        }
+        if self.listen.is_none() {
+            return fail(
+                "端口复用只对被动模式（`--listen`）有意义，主动模式不监听任何端口".to_owned(),
+            );
+        }
+        // 被改道到的是**被动监听**那条链路，它由 `--up`（缺省回落 `-l`）决定；
+        // `--down` 是子节点链路，与 iptables 改道的目标是两回事。
+        let spec = self.upstream_spec().map_err(|e| ArgsError::BadReuse {
+            reason: e.to_string(),
+        })?;
+        if spec.kind != stowaway_protocol::TransportKind::Raw {
+            return fail(format!(
+                "端口复用只能与 `raw` 组合（iptables 改道的是 TCP 流量），当前是 `{:?}`",
+                spec.kind
+            ));
         }
         Ok(())
     }
@@ -512,5 +571,81 @@ mod tests {
             args.check_proxy_credentials(),
             Err(ArgsError::HalfProxyCredentials)
         );
+    }
+
+    #[test]
+    fn reuse_needs_both_magic_and_report() {
+        // 只给 magic：没有回落目标，陌生流量会被当成握手失败丢掉。
+        let only_magic = parse(&["agent", "-l", "8080", "--reuse-magic", "0123456789abcdef"]);
+        assert!(
+            matches!(only_magic.check_reuse(), Err(ArgsError::BadReuse { .. })),
+            "只给 magic 必须拒绝"
+        );
+        // 只给 report：没有规则把流量引来，等于什么都没配。
+        let only_report = parse(&["agent", "-l", "8080", "--report", "9000"]);
+        assert!(matches!(
+            only_report.check_reuse(),
+            Err(ArgsError::BadReuse { .. })
+        ));
+        // 成对给出即可通过。
+        let both = parse(&[
+            "agent",
+            "-l",
+            "8080",
+            "--reuse-magic",
+            "0123456789abcdef",
+            "--report",
+            "9000",
+        ]);
+        assert_eq!(both.check_reuse(), Ok(()));
+    }
+
+    #[test]
+    fn reuse_magic_must_be_exactly_sixteen_characters() {
+        let short = parse(&[
+            "agent",
+            "-l",
+            "8080",
+            "--reuse-magic",
+            "0123456789abcde",
+            "--report",
+            "9000",
+        ]);
+        assert!(matches!(
+            short.check_reuse(),
+            Err(ArgsError::BadReuse { .. })
+        ));
+    }
+
+    #[test]
+    fn reuse_is_rejected_for_active_mode_and_non_raw_transport() {
+        // 主动模式不监听，规则没有可改道的目标。
+        let active = parse(&[
+            "agent",
+            "-c",
+            "h:1",
+            "--reuse-magic",
+            "0123456789abcdef",
+            "--report",
+            "9000",
+        ]);
+        assert!(matches!(
+            active.check_reuse(),
+            Err(ArgsError::BadReuse { .. })
+        ));
+        // ws 上没有可被 REDIRECT 的 TCP 流量。规则改道的是**被动监听**这条
+        // 链路，而它由 `--up`（或 `-l`）决定，所以这里用 `--up` 断言。
+        let ws = parse(&[
+            "agent",
+            "-l",
+            "8080",
+            "--up",
+            "ws://h:1",
+            "--reuse-magic",
+            "0123456789abcdef",
+            "--report",
+            "9000",
+        ]);
+        assert!(matches!(ws.check_reuse(), Err(ArgsError::BadReuse { .. })));
     }
 }

@@ -54,9 +54,6 @@ async fn main() -> anyhow::Result<()> {
     if args.via_proxy() {
         tracing::warn!("上游代理已解析但尚未接入拨号路径（P7 联调项）");
     }
-    if args.reuse_magic.is_some() || args.report.is_some() {
-        tracing::warn!("端口复用（iptables）尚未接入（P7 联调项，plan §4.11）");
-    }
     if args.tls && pin.is_none() && !args.tls_tofu {
         tracing::warn!("TLS 未给 `--tls-pin` 也未开 `--tls-tofu`：将按 TOFU 首次信任");
     }
