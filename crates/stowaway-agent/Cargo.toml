@@ -9,6 +9,16 @@ license.workspace = true
 name = "stowaway-agent"
 path = "src/main.rs"
 
+[features]
+# 默认与 `stowaway-transport` 的默认一致（全开）。存在的理由是让「不要 TLS」
+# 的构建能成立：`ring` / `aws-lc-rs` 都需要 C 工具链，交叉编译场景里可能只有
+# 一个 `cc`（plan §4.14 E31）。注意 `build-matrix` **不使用**它——tier-3 的
+# 两档靠预装交叉 gcc 走默认 feature 全开，判据才覆盖真实发布形态。
+default = ["transport-raw", "transport-ws", "tls"]
+transport-raw = ["stowaway-transport/transport-raw"]
+transport-ws = ["stowaway-transport/transport-ws"]
+tls = ["stowaway-transport/tls"]
+
 [dependencies]
 stowaway-protocol = { workspace = true }
 stowaway-crypto = { workspace = true }
