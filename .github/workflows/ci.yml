@@ -167,6 +167,15 @@ jobs:
           curl -sSL -o "$RUNNER_TEMP/xcc.tar.bz2" "${{ matrix.xcc }}"
           tar -xjf "$RUNNER_TEMP/xcc.tar.bz2" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/${{ matrix.xcc_dir }}/bin" >> "$GITHUB_PATH"
+          # `-Z build-std` 的 armv5te 链接行里 rustc 会传 `-lunwind`（aarch64/arm 走
+          # libunwind，mips 不走），而 Bootlin 的 sysroot 只装 `libgcc_eh.a` ——
+          # 两者提供同一套 `_Unwind_*`，`libgcc_eh.a` 就是 GCC 自带的 unwind 实现。
+          # 实测：`gcc -lunwind -static` 在有该符号链接时能出正确 ELF，缺了则
+          # `ld: cannot find -lunwind`（本轮 CI 的 arm 失败点）。
+          glib=$(find "$RUNNER_TEMP/${{ matrix.xcc_dir }}/lib/gcc" -maxdepth 2 -name libgcc_eh.a | head -1)
+          if [ -n "$glib" ] && [ ! -e "$(dirname "$glib")/libunwind.a" ]; then
+            ln -s libgcc_eh.a "$(dirname "$glib")/libunwind.a"
+          fi
 
       - name: Install apt cross linker
         if: matrix.apt != ''
