@@ -958,7 +958,11 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
     /// 返回 `None` 表示可用；`Some(原因)` 表示按矩阵定义**本机不可用**（skipped）。
     fn unavailable(row: &Combo, tc: &Toolchain) -> Option<String> {
         let mut reasons = Vec::new();
-        if !tc.has_target(row.triple) {
+        // tier-3 走 `-Z build-std`：std 由 nightly 从 rust-src **现场编译**，
+        // 本来就不需要 `rustup target add`（也没有预编译件可装）。
+        // 早期版本这里无条件要求已装 target，于是 CI 上「nightly 已就位、
+        // rust-src 已装」的 tier-3 job 仍被判 skipped——判据被自己的前置条件挡死。
+        if !row.tier3 && !tc.has_target(row.triple) {
             reasons.push(match &tc.installed_err {
                 Some(e) => format!("该 triple 不可用（{e}）"),
                 None => "`rustup target list --installed` 里没有该 triple".to_string(),
@@ -1480,6 +1484,85 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
             format!("{n} B")
         } else {
             format!("{v:.1} {}", UNITS[i])
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// 构造一个可控的工具链快照（不碰真实 rustup 状态）。
+        fn tc(installed: &[&str], nightly: bool) -> Toolchain {
+            Toolchain {
+                installed: installed.iter().map(|s| (*s).to_string()).collect(),
+                installed_err: None,
+                release: if nightly {
+                    "1.102.0-nightly".to_string()
+                } else {
+                    "1.100.0".to_string()
+                },
+                nightly,
+            }
+        }
+
+        fn row(triple: &'static str, tier3: bool) -> Combo {
+            Combo {
+                os: "linux",
+                arch: "x",
+                triple,
+                plat: "linux_x",
+                agent: true,
+                admin: true,
+                tier3,
+            }
+        }
+
+        #[test]
+        fn skipped_fails_everywhere_except_local() {
+            // 判据没跑就不能是绿的（plan §4.14 E30）。本地 `--local` 是唯一的例外：
+            // 宿主之外的组合本机装不上 target，跳过是预期。
+            assert!(skipped_is_failure(false), "非 --local：跳过必须判失败");
+            assert!(!skipped_is_failure(true), "--local：跳过不算失败");
+        }
+
+        #[test]
+        fn tier3_does_not_require_an_installed_target() {
+            // `-Z build-std` 由 nightly 从 rust-src 现场编译 std，没有预编译件可装。
+            // 早期版本无条件要求已装 target，把「nightly + rust-src 都就位」的
+            // tier-3 job 判成 skipped——判据被自己的前置条件挡死（首次 CI 现象）。
+            let t = tc(&["x86_64-unknown-linux-gnu"], true);
+            assert!(
+                unavailable(&row("armv5te-unknown-linux-musleabi", true), &t).is_none(),
+                "nightly 就位时 tier-3 不该被判 skipped"
+            );
+        }
+
+        #[test]
+        fn tier3_still_requires_nightly() {
+            let t = tc(&["x86_64-unknown-linux-gnu"], false);
+            let reason = unavailable(&row("mipsel-unknown-linux-musl", true), &t)
+                .expect("stable 下 tier-3 必须给出原因");
+            assert!(
+                reason.contains("nightly") && reason.contains("build-std"),
+                "原因要说清缺什么：{reason}"
+            );
+        }
+
+        #[test]
+        fn non_tier3_still_requires_the_target() {
+            let t = tc(&["x86_64-unknown-linux-gnu"], false);
+            let reason = unavailable(&row("aarch64-unknown-linux-gnu", false), &t)
+                .expect("没装 target 的普通组合必须给出原因");
+            assert!(
+                reason.contains("rustup target list"),
+                "原因指向具体缺口：{reason}"
+            );
+        }
+
+        #[test]
+        fn available_targets_are_available() {
+            let t = tc(&["x86_64-unknown-linux-gnu"], false);
+            assert!(unavailable(&row("x86_64-unknown-linux-gnu", false), &t).is_none());
         }
     }
 }

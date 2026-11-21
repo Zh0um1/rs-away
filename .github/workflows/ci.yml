@@ -233,7 +233,13 @@ jobs:
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
                 | sh -s -- -y --profile minimal --default-toolchain nightly
               . "$HOME/.cargo/env"
-              rustup component add rust-src
+              # 必须显式 `--toolchain nightly`：仓库里的 `rust-toolchain.toml` 把
+              # 活动工具链钉在 stable，裸 `rustup component add rust-src` 会把
+              # rust-src 装到 **stable** 上（日志里能看到
+              # `the missing active toolchain stable-... has been auto-installed`），
+              # 于是随后的 `-Z build-std` 在 nightly 下报
+              # "nightly/lib/rustlib/src/rust/library/Cargo.lock does not exist"。
+              rustup component add rust-src --toolchain nightly
               # rust-toolchain.toml 钉的是 stable，必须用 RUSTUP_TOOLCHAIN 压过它，
               # 否则就是「装了 nightly 却在跑 stable」（首次 CI 的 tier-3 假绿）。
               export RUSTUP_TOOLCHAIN=nightly
