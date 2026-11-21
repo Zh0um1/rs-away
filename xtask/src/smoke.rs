@@ -166,8 +166,11 @@ fn build(root: &Path, release: bool) -> Result<(), String> {
         // 冒烟不是竞速，单线程链接最省事。
         "-j",
         "1",
-        "--offline",
     ]);
+    // 本机只能离线（plan §1.3：`/` 只读，依赖全在 .cargo-home）；CI 上要现拉依赖。
+    if std::env::var_os("CI").is_none() && root.join(".cargo-home").join("registry").is_dir() {
+        cmd.arg("--offline");
+    }
     if release {
         cmd.arg("--release");
     }

@@ -59,6 +59,157 @@ jobs:
           STOWAWAY_GO_BASELINE: ${{ github.workspace }}/baseline/stowaway
         run: cargo run -p xtask -- doccheck
 
+  # §4.13 的 11 个 blocking 组合在这里证明「能否编译」。本地只验证宿主 musl 档
+  # （`cargo xtask build-matrix --local`）：本机 `/` 只读，`rustup target add` 直接
+  # 失败，装不上任何交叉 target（plan §1.3、§4.14 E22）。
+  build-linux:
+    name: build linux/${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            triple: x86_64-unknown-linux-gnu
+            apt: ""
+            linker: ""
+            tier3: false
+          - arch: i686
+            triple: i686-unknown-linux-gnu
+            apt: gcc-multilib
+            linker: ""
+            tier3: false
+          - arch: aarch64
+            triple: aarch64-unknown-linux-gnu
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+            tier3: false
+          - arch: arm (tier-3)
+            triple: armv5te-unknown-linux-musleabi
+            apt: ""
+            linker: ""
+            tier3: true
+          - arch: mipsle (tier-3)
+            triple: mipsel-unknown-linux-musl
+            apt: ""
+            linker: ""
+            tier3: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          if [ "${{ matrix.tier3 }}" = "true" ]; then
+            rustup toolchain install nightly --profile minimal --component rust-src
+            rustup default nightly
+          else
+            rustup toolchain install stable --profile minimal
+            rustup default stable
+            rustup target add ${{ matrix.triple }}
+          fi
+      - name: Install cross linker
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+          mkdir -p .cargo
+          printf '[target.%s]\nlinker = "%s"\n' "${{ matrix.triple }}" "${{ matrix.linker }}" >> .cargo/config.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo run -q -p xtask -- build-matrix --target ${{ matrix.triple }}
+
+  build-darwin:
+    name: build darwin/${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            triple: x86_64-apple-darwin
+          - arch: aarch64
+            triple: aarch64-apple-darwin
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -q -p xtask -- build-matrix --target ${{ matrix.triple }}
+
+  # windows 的两个组合都是 `*-pc-windows-gnu`（plan §4.13），需要 MinGW 的 gcc。
+  build-windows:
+    name: build windows/${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            triple: x86_64-pc-windows-gnu
+            msys: mingw-w64-x86_64-gcc
+          - arch: i686
+            triple: i686-pc-windows-gnu
+            msys: mingw-w64-i686-gcc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW
+        run: |
+          C:\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm ${{ matrix.msys }}"
+          echo "$env:C:\msys64\mingw64\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -q -p xtask -- build-matrix --target ${{ matrix.triple }}
+
+  # FreeBSD 没有原生 runner，走 VM（plan §4.13 原本就写明「CI 走 FreeBSD VM/qemu」）。
+  build-freebsd:
+    name: build freebsd/${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: i686
+            triple: i686-unknown-freebsd
+          - arch: arm
+            triple: armv6-unknown-freebsd
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install -y bash curl
+          run: |
+            set -e
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            . "$HOME/.cargo/env"
+            rustup target add ${{ matrix.triple }}
+            cargo build --release -j 1 --target ${{ matrix.triple }} -p stowaway-agent
+            cargo build --release -j 1 --target ${{ matrix.triple }} -p stowaway-admin
+
+  # §8.6 第五、六条在 CI 上也必须跑：本地有 geiger 但 CI 没有，回退路径要验。
+  extras:
+    name: no-panic / no-unsafe / smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: no-panic
+        run: cargo run -q -p xtask -- no-panic
+      - name: no-unsafe (cargo-geiger)
+        run: |
+          cargo install cargo-geiger --locked || echo "geiger 装不上，回退到内置扫描器"
+          cargo run -q -p xtask -- no-unsafe
+      - name: smoke
+        run: cargo run -q -p xtask -- smoke
+
   audit:
     name: cargo deny (license + advisory)
     runs-on: ubuntu-latest

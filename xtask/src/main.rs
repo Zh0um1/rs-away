@@ -207,11 +207,22 @@ fn run_no_panic() -> ExitCode {
     }
 }
 
-/// `no-unsafe`：plan.md §8.6 第六条 DoD（原口径 `cargo geiger`）的等价实现。
+/// `no-unsafe`：plan.md §8.6 第六条 DoD。
 ///
-/// `cargo-geiger` 无法在本仓库环境安装（离线缓存里没有该 crate，联网安装也失败），
-/// 因此改为自建扫描器：对每个 crate 的 `src/` 逐行统计**真正构成 unsafe 作用域**的
-/// 构造 —— `unsafe {`、`unsafe fn`、`unsafe impl`、`unsafe trait`、`extern "C"`。
+/// 判据本身是**`cargo geiger`**。本命令优先直接调用它：对三个受门禁的 crate 分别
+/// 跑 `cargo geiger --output-format Json`，解析 `packages[].unsafety.used`，要求
+/// ① `forbids_unsafe == true`（`#![forbid(unsafe_code)]` 真的在生效）且
+/// ② 五类 unsafe 计数（functions / exprs / item_impls / item_traits / methods）全为 0。
+///
+/// 注意**不能看 `cargo geiger` 的退出码**：本仓库的 manifest 里 `lints.cargo` 是
+///  nightly 才支持的表键，稳定版 cargo 会报 8 条 `unused manifest key` 警告，geiger
+/// 因此以 1 退出——而这三行警告与被检查对象无关。因此这里只信 JSON 里的计数。
+///
+/// **回退**：`cargo-geiger` 不可用（CI 上没装、或用户改用最小工具链）时，退到自建
+/// 扫描器：对每个 crate 的 `src/` 逐行统计**真正构成 unsafe 作用域**的构造 ——
+/// `unsafe {`、`unsafe fn`、`unsafe impl`、`unsafe trait`、`extern "C"`。两条路径
+/// 的判据一致（都是「受门禁的三个 crate 计数为 0」），只是精度不同：geiger 走的是
+/// 编译器 HIR，扫描器走的是文本。
 ///
 /// 与 `no-panic` 的两点差异，都是**有意**的：
 /// 1. 扫**全部**行，遇到 `#[cfg(test)]` 不提前退出 —— `unsafe` 不能用「在测试里」豁免，
@@ -222,15 +233,109 @@ fn run_no_panic() -> ExitCode {
 /// `#![forbid(unsafe_code)]` / `unsafe_op_in_unsafe_fn` 是**禁用声明**，不是使用，
 /// 出现它们本身应被跳过（否则每个 crate 都会永远报 1 处）。
 fn run_no_unsafe() -> ExitCode {
+    if let Some(code) = run_no_unsafe_via_geiger() {
+        return code;
+    }
+    println!("no-unsafe: 未找到 `cargo-geiger`，回退到内置扫描器（判据相同，精度不同）");
+    run_no_unsafe_scan()
+}
+
+/// plan.md §8.6：protocol / crypto / transport 三个 crate 的 unsafe 计数必须为 0。
+/// core 及以上允许出现平台相关 unsafe（目前也确为 0），单独统计但不作为门禁。
+const NO_UNSAFE_GATED: [&str; 3] = ["protocol", "crypto", "transport"];
+const NO_UNSAFE_REPORTED: [&str; 3] = ["core", "admin", "agent"];
+
+/// 用 `cargo geiger` 做门禁。返回 `None` 表示 geiger 不可用（交给扫描器兜底）。
+fn run_no_unsafe_via_geiger() -> Option<ExitCode> {
     let root = repo_root();
-    // plan.md §8.6：protocol / crypto / transport 三个 crate 的 unsafe 计数必须为 0。
-    // core 及以上允许出现平台相关 unsafe（目前也确为 0），单独统计但不作为门禁。
-    const GATED: [&str; 3] = ["protocol", "crypto", "transport"];
-    const REPORTED: [&str; 3] = ["core", "admin", "agent"];
+    // geiger 0.14 不接受 virtual manifest（workspace 根），必须进到各 crate 目录里跑。
+    let mut gated_violations = 0usize;
+    let mut reported_violations = 0usize;
+    for name in NO_UNSAFE_GATED.into_iter().chain(NO_UNSAFE_REPORTED) {
+        let crate_dir = root.join("crates").join(format!("stowaway-{name}"));
+        let gated = NO_UNSAFE_GATED.contains(&name);
+        let out = match Command::new("cargo")
+            .args(["geiger", "--offline", "--output-format", "Json"])
+            .current_dir(&crate_dir)
+            .output()
+        {
+            Ok(o) => o,
+            // 命令本身跑不起来（没装 geiger）：交给扫描器。
+            Err(_) => return None,
+        };
+        // `cargo geiger` 在「子命令不存在」时以 101 退出并在 stderr 里说明；
+        // 这里只把「完全解析不出 JSON」当作不可用，其余照常解析。
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let metrics = parse_geiger_crate(&stdout, &format!("stowaway-{name}"))?;
+        let (forbids, total) = metrics;
+        let count = total as usize;
+        if gated {
+            gated_violations += count;
+            if !forbids {
+                eprintln!(
+                    "no-unsafe: stowaway-{name} 的 `#![forbid(unsafe_code)]` 未生效（cargo geiger 报告 forbids_unsafe=false）"
+                );
+                gated_violations += 1;
+            }
+        } else {
+            reported_violations += count;
+        }
+        println!(
+            "no-unsafe: stowaway-{name}: {count} 处 unsafe（forbids_unsafe={forbids}）{} [cargo geiger]",
+            if gated {
+                "（门禁）"
+            } else {
+                "（仅统计）"
+            }
+        );
+    }
+    if gated_violations == 0 {
+        println!(
+            "no-unsafe: cargo geiger 判定 —— 受门禁的三个 crate 0 处 unsafe 且 forbid 生效（其余 crate 共 {reported_violations} 处）"
+        );
+        Some(ExitCode::SUCCESS)
+    } else {
+        eprintln!(
+            "no-unsafe: 受门禁的 crate 有 {gated_violations} 处问题（plan.md §8.6 要求为 0）"
+        );
+        Some(ExitCode::FAILURE)
+    }
+}
+
+/// 从 `cargo geiger --output-format Json` 的 stdout 里取出目标 crate 的
+/// `(forbids_unsafe, unsafe 总数)`。解析不出（JSON 结构变了、crate 不在结果里）返回
+/// `None`，让调用方退回扫描器 —— **宁可换实现，也不要静默当成 0**。
+fn parse_geiger_crate(stdout: &str, crate_name: &str) -> Option<(bool, u64)> {
+    // geiger 会把别的东西混进 stdout 吗？目前不会，但 cargo 的 warning 走 stderr，
+    // 这里仍然从第一个 `{` 开始截，避免前置杂讯让解析整体失败。
+    let start = stdout.find('{')?;
+    let value: serde_json::Value = serde_json::from_str(&stdout[start..]).ok()?;
+    let packages = value.get("packages")?.as_array()?;
+    let entry = packages.iter().find(|p| {
+        p.pointer("/package/id/name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| name == crate_name)
+    })?;
+    let forbids = entry
+        .pointer("/unsafety/forbids_unsafe")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    // 五类计数各自是 `{"safe": n, "unsafe_": n}`。
+    let used = entry.pointer("/unsafety/used")?;
+    let mut total = 0u64;
+    for key in ["functions", "exprs", "item_impls", "item_traits", "methods"] {
+        total += used.pointer(&format!("/{key}/unsafe_"))?.as_u64()?;
+    }
+    Some((forbids, total))
+}
+
+/// `no-unsafe`：plan.md §8.6 第六条的**回退**实现（`cargo-geiger` 不可用时）。
+fn run_no_unsafe_scan() -> ExitCode {
+    let root = repo_root();
     let mut total_files = 0usize;
     let mut gated_violations = 0usize;
     let mut reported_violations = 0usize;
-    for name in GATED.into_iter().chain(REPORTED) {
+    for name in NO_UNSAFE_GATED.into_iter().chain(NO_UNSAFE_REPORTED) {
         let src = root
             .join("crates")
             .join(format!("stowaway-{name}"))
@@ -239,7 +344,7 @@ fn run_no_unsafe() -> ExitCode {
         collect_rs(&src, &mut files);
         files.sort();
         total_files += files.len();
-        let gated = GATED.contains(&name);
+        let gated = NO_UNSAFE_GATED.contains(&name);
         let mut count = 0usize;
         for file in &files {
             let text = match std::fs::read_to_string(file) {
@@ -576,6 +681,50 @@ mod build_matrix {
         },
     ];
 
+    /// 宿主 musl 组合（plan §4.13 的 best-effort 档，**不进 blocking 清单**）。
+    ///
+    /// 本地验证只跑这一档：11 个 blocking 组合交给 CI 证明——本机 `/` 只读
+    /// （plan §1.3），连 `rustup target add` 都会失败，本地重复交叉编译既装不上
+    /// target，也不可能比 CI 更有说服力。musl 静态链接是本地唯一能真实验证的形态。
+    static MUSL_MATRIX: [Combo; 4] = [
+        Combo {
+            os: "linux",
+            arch: "x86_64-musl",
+            triple: "x86_64-unknown-linux-musl",
+            plat: "linux_x64_musl",
+            agent: true,
+            admin: true,
+            tier3: false,
+        },
+        Combo {
+            os: "linux",
+            arch: "i686-musl",
+            triple: "i686-unknown-linux-musl",
+            plat: "linux_x86_musl",
+            agent: true,
+            admin: true,
+            tier3: false,
+        },
+        Combo {
+            os: "linux",
+            arch: "aarch64-musl",
+            triple: "aarch64-unknown-linux-musl",
+            plat: "linux_arm64_musl",
+            agent: true,
+            admin: true,
+            tier3: false,
+        },
+        Combo {
+            os: "linux",
+            arch: "arm-musleabihf",
+            triple: "armv7-unknown-linux-musleabihf",
+            plat: "linux_armv7_musl",
+            agent: true,
+            admin: true,
+            tier3: false,
+        },
+    ];
+
     #[derive(Debug)]
     struct Combo {
         os: &'static str,
@@ -633,6 +782,9 @@ mod build_matrix {
         list: bool,
         dry_run: bool,
         out: Option<PathBuf>,
+        /// `--local`：只跑「本地能验证」的那一档（宿主 musl），11 个 blocking
+        /// 组合交给 CI。见 `MUSL_MATRIX` 的说明。
+        local: bool,
     }
 
     impl Default for Config {
@@ -644,6 +796,7 @@ mod build_matrix {
                 list: false,
                 dry_run: false,
                 out: None,
+                local: false,
             }
         }
     }
@@ -664,6 +817,7 @@ mod build_matrix {
                 "-h" | "--help" => return Ok(Parsed::Help),
                 "--list" => cfg.list = true,
                 "--dry-run" => cfg.dry_run = true,
+                "--local" => cfg.local = true,
                 "--agent-only" | "--admin-only" => {
                     let side = if a == "--agent-only" {
                         Side::Agent
@@ -719,6 +873,8 @@ mod build_matrix {
 release/arm_eabi5_agent、release/mipsel_agent、release/freebsd_x86_agent …）。
 
 选项：
+  --local             只跑宿主 musl 档（本地能真实验证的那几行），
+                      blocking 的 11 个组合交给 CI；与 --target 互斥
   --target <triple>   只构建指定 target triple（不在矩阵里则报错）
   --agent-only        只构建 agent 侧
   --admin-only        只构建 admin 侧
@@ -726,6 +882,11 @@ release/arm_eabi5_agent、release/mipsel_agent、release/freebsd_x86_agent …�
   --dry-run           打印将要执行的命令，不执行
   --out <dir>         产物目录，默认 release/（相对仓库根）
   -h, --help          显示本帮助
+
+本地与 CI 的分工（plan §4.13）：本机 `/` 只读，`rustup target add` 会失败，因此除了
+已有的 x86_64-unknown-linux-gnu 与 -musl 之外一个 target 都装不上。`--local` 只跑
+`MUSL_MATRIX`（宿主 musl 静态链接），11 个 blocking 组合由 CI 的 build-matrix job
+在各自 runner 上交叉编译——那才是发布矩阵的证明地。
 
 每个组合按 target 是否安装（`rustup target list --installed`）报三种状态：
   ok       构建成功，产物落在 --out 目录
@@ -817,21 +978,30 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
     }
 
     pub fn run(root: &Path, cfg: &Config) -> ExitCode {
-        let combos: Vec<&'static Combo> = MATRIX
+        // `--local` 换成宿主 musl 那一档；它与 `--target` 互斥（两个都在指定「跑哪几行」）。
+        if cfg.local && cfg.target.is_some() {
+            eprintln!("build-matrix: `--local` 与 `--target` 互斥");
+            return ExitCode::FAILURE;
+        }
+        let table: &[Combo] = if cfg.local { &MUSL_MATRIX } else { &MATRIX };
+        let combos: Vec<&'static Combo> = table
             .iter()
             .filter(|c| cfg.target.as_deref().is_none_or(|t| c.triple == t))
             .collect();
         if combos.is_empty() {
             let t = cfg.target.as_deref().unwrap_or("");
-            eprintln!(
-                "build-matrix: triple `{t}` 不在 plan §4.13 的 11 个 blocking 组合里（用 `--list` 查看）"
-            );
+            let scope = if cfg.local {
+                "本地 musl 档"
+            } else {
+                "plan §4.13 的 11 个 blocking 组合"
+            };
+            eprintln!("build-matrix: triple `{t}` 不在{scope}里（用 `--list` 查看）");
             return ExitCode::FAILURE;
         }
 
         let tc = Toolchain::detect();
         if cfg.list {
-            print_list(&combos, &tc);
+            print_list(&combos, &tc, cfg.local);
             return ExitCode::SUCCESS;
         }
 
@@ -858,6 +1028,12 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
         if jobs.is_empty() {
             println!("build-matrix: 所选组合经 `--agent-only` / `--admin-only` 过滤后没有产物");
             return ExitCode::SUCCESS;
+        }
+        if cfg.local {
+            println!(
+                "build-matrix（--local）：只验证宿主 musl 档（{} 行）；11 个 blocking 组合由 CI 的 build-matrix job 证明（plan §4.13）",
+                combos.len()
+            );
         }
         println!(
             "build-matrix: {} 个组合 / {} 个产物，out={}，target_dir={}",
@@ -926,7 +1102,7 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
             println!("    skipped：{reason}");
             return Status::Skipped(reason);
         }
-        let argv = build_argv(row, side);
+        let argv = build_argv(root, row, side);
         let bin = host_bin(target_dir, row, side);
         let artifact_path = out_dir.join(row.artifact(side));
 
@@ -1025,11 +1201,33 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
         Status::Ok { bytes, alias }
     }
 
-    fn build_argv(row: &Combo, side: Side) -> Vec<String> {
-        // 资源受限（plan §1.3）与可复现：一律 `--offline -j 2`。
-        let mut v: Vec<String> = ["cargo", "build", "--release", "--offline", "-j", "2"]
+    /// 内部 `cargo` 调用要不要加 `--offline`。
+    ///
+    /// 本机（plan §1.3：`/` 只读）只能吃 `.cargo-home` 里的缓存，必须离线；CI 上
+    /// 依赖要现拉，加 `--offline` 会让第一次构建直接失败。判据是「有没有走网络的条件」：
+    /// CI 环境变量在场就联网，否则只看仓库内缓存目录是否存在。
+    fn use_offline(root: &Path) -> bool {
+        if std::env::var_os("CI").is_some() {
+            return false;
+        }
+        // 显式覆盖：`STOWAWAY_OFFLINE=0` 可在联网机器上关掉。
+        match std::env::var("STOWAWAY_OFFLINE").ok().as_deref() {
+            Some("0") | Some("false") => return false,
+            Some(_) => return true,
+            None => {}
+        }
+        root.join(".cargo-home").join("registry").is_dir()
+    }
+
+    fn build_argv(root: &Path, row: &Combo, side: Side) -> Vec<String> {
+        // 链接 **release** 时两个 ~90MB 二进制并行会让 LLVM 自己崩（plan §4.14 E27），
+        // 因此这里固定 `-j 1` —— 每次调用只产出一个二进制，串行链接是唯一稳的形态。
+        let mut v: Vec<String> = ["cargo", "build", "--release", "-j", "1"]
             .map(String::from)
             .to_vec();
+        if use_offline(root) {
+            v.push("--offline".to_string());
+        }
         if row.tier3 {
             // tier-3 无预编译 std；feature 门控（关 tls/ws/kcp）需 crate 侧配合，
             // 见 plan §4.13 / §9.1。本机非 nightly 时早已在 unavailable() 里跳过。
@@ -1119,11 +1317,18 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
             .collect()
     }
 
-    fn print_list(combos: &[&'static Combo], tc: &Toolchain) {
-        println!(
-            "plan §4.13 blocking 矩阵：{} 个 OS-ARCH 组合（产物名对齐 Go 版 Makefile：release/<plat>_<side>）",
-            combos.len()
-        );
+    fn print_list(combos: &[&'static Combo], tc: &Toolchain, local: bool) {
+        if local {
+            println!(
+                "本地 musl 档：{} 个组合（plan §4.13 的 best-effort 档；blocking 的 11 个组合由 CI 证明）",
+                combos.len()
+            );
+        } else {
+            println!(
+                "plan §4.13 blocking 矩阵：{} 个 OS-ARCH 组合（产物名对齐 Go 版 Makefile：release/<plat>_<side>）",
+                combos.len()
+            );
+        }
         println!(
             "{:<10} {:<9} {:<22} {:<24} {:<34} AVAIL",
             "OS", "ARCH", "AGENT", "ADMIN", "TRIPLE"
