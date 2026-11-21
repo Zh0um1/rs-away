@@ -1070,7 +1070,22 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
             });
         }
 
-        print_results(root, &out_dir, &results)
+        // CI 上「该编的组合被跳过」等于没验证，必须红；本地跑 `--local` 时目标
+        // 架构本来就装不上，跳过是常态（plan §4.14 E22）。
+        print_results(root, &out_dir, &results, skipped_is_failure(cfg.local))
+    }
+
+    /// 跳过是否算失败。
+    ///
+    /// 首次 CI 的教训：`build linux/(arm,mipsle)` 两个 tier-3 job 显示成功，
+    /// 实际输出是 `skipped`——`rust-toolchain.toml` 把 channel 钉在 stable，
+    /// `rustup default nightly` 对它无效，于是 `-Z build-std` 从没跑起来，而
+    /// `skipped` 不置非 0 退出码。判据没跑就该是红的（plan §4.14 E30）。
+    ///
+    /// 本地用 `--local` 验证宿主 musl 档时，`i686`/`aarch64`/`armv7` 三条本机
+    /// 装不上 target，跳过是预期结果，不能判失败。
+    const fn skipped_is_failure(local: bool) -> bool {
+        !local
     }
 
     #[derive(Debug)]
@@ -1374,7 +1389,12 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
         }
     }
 
-    fn print_results(root: &Path, out_dir: &Path, results: &[Outcome]) -> ExitCode {
+    fn print_results(
+        root: &Path,
+        out_dir: &Path,
+        results: &[Outcome],
+        skipped_fails: bool,
+    ) -> ExitCode {
         println!("\n汇总：");
         println!(
             "{:<10} {:<9} {:<6} {:<24} {:<8} DETAIL",
@@ -1424,14 +1444,22 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
             }
         );
         if skipped > 0 {
-            println!("skipped 不影响退出码（CI 上可据此看出本机与发布矩阵的差异）");
+            if skipped_fails {
+                eprintln!(
+                    "build-matrix: {skipped} 个组合被跳过，而这里必须真正编译（本地验证请用 --local）"
+                );
+            } else {
+                println!("skipped 不影响退出码（--local：宿主之外的组合本机装不上 target）");
+            }
         }
         if failed > 0 {
             eprintln!("build-matrix: {failed} 个组合本应可用却构建失败");
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
+            return ExitCode::FAILURE;
         }
+        if skipped > 0 && skipped_fails {
+            return ExitCode::FAILURE;
+        }
+        ExitCode::SUCCESS
     }
 
     fn display_rel(root: &Path, path: &Path) -> String {

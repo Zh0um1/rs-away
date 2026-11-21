@@ -21,10 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain (MSRV)
+      # 主门禁跑 stable：这是已被证明能过的形态。MSRV 单独一个 job 验证，
+      # 免得「1.89 编不过」把 fmt/clippy/test 一起拖红，看不出失败原因。
+      - name: Install toolchain
         run: |
-          rustup toolchain install "$MSRV" --profile minimal --component rustfmt,clippy
-          rustup default "$MSRV"
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
 
       - uses: Swatinem/rust-cache@v2
 
@@ -41,6 +43,25 @@ jobs:
       - name: build (raw only)
         run: cargo build -p stowaway-transport --no-default-features --features transport-raw
 
+  # Cargo.toml 声明 `rust-version = "1.89"`，但 `rust-toolchain.toml` 钉的是 stable，
+  # 所以 `rustup default 1.89.0` 在仓库目录里会被工具链文件覆盖——必须用
+  # RUSTUP_TOOLCHAIN 环境变量（rustup 优先级：env > toolchain file）。
+  # 首次 CI 就因为漏了这点，MSRV 其实从未被验证过。
+  msrv:
+    name: rust 1.89 (MSRV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MSRV toolchain
+        run: |
+          rustup toolchain install "$MSRV" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$MSRV" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - name: build (all targets, MSRV)
+        run: cargo build --workspace --all-features
+      - name: test (all targets, MSRV)
+        run: cargo test --workspace --all-features
+
   doccheck:
     name: docs 源码引用校验
     runs-on: ubuntu-latest
@@ -52,7 +73,7 @@ jobs:
           repository: ph4ntonn/Stowaway
           path: baseline/stowaway
           # 基线 HEAD 见 docs/plan.md 首页；升级基线必须同步改文档后再改这里。
-          ref: 7f715be
+          ref: 7f715be3e7331fa7fd558ba96bf3c3a3e6ddfbea
       - uses: Swatinem/rust-cache@v2
       - name: doccheck
         env:
@@ -96,23 +117,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `rust-toolchain.toml` 把 channel 钉在 stable，`rustup default nightly` 在
+      # 仓库目录里对它无效；tier-3 需要 nightly 的 `-Z build-std`，只能用
+      # RUSTUP_TOOLCHAIN 环境变量压过工具链文件（rustup 的优先级：env > file）。
+      # 漏掉这一步会让 tier-3 job 静默走到 `skipped` 分支，而 skipped 不置非 0
+      # 退出码——job 显示成功但什么都没编译（首次 CI 就是这样骗过了眼睛）。
       - name: Install toolchain
         run: |
           if [ "${{ matrix.tier3 }}" = "true" ]; then
             rustup toolchain install nightly --profile minimal --component rust-src
             rustup default nightly
+            echo "RUSTUP_TOOLCHAIN=nightly" >> "$GITHUB_ENV"
           else
             rustup toolchain install stable --profile minimal
             rustup default stable
             rustup target add ${{ matrix.triple }}
           fi
+      # i686 只装 gcc-multilib，不写 linker：rustc 对 i686-unknown-linux-gnu 自己会传
+      # `-m32`，写 `linker = ""` 反而会让它报 "couldn't extract file stem from
+      # specified linker"（首次 CI 就是这条）。只有真需要指定交叉 gcc 时才写。
       - name: Install cross linker
         if: matrix.apt != ''
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt }}
-          mkdir -p .cargo
-          printf '[target.%s]\nlinker = "%s"\n' "${{ matrix.triple }}" "${{ matrix.linker }}" >> .cargo/config.toml
+          if [ -n "${{ matrix.linker }}" ]; then
+            mkdir -p .cargo
+            printf '[target.%s]\nlinker = "%s"\n' "${{ matrix.triple }}" "${{ matrix.linker }}" >> .cargo/config.toml
+          fi
       - uses: Swatinem/rust-cache@v2
       - name: build
         run: cargo run -q -p xtask -- build-matrix --target ${{ matrix.triple }}
@@ -147,16 +179,21 @@ jobs:
           - arch: x86_64
             triple: x86_64-pc-windows-gnu
             msys: mingw-w64-x86_64-gcc
+            bindir: C:/msys64/mingw64/bin
           - arch: i686
             triple: i686-pc-windows-gnu
             msys: mingw-w64-i686-gcc
+            bindir: C:/msys64/mingw32/bin
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      # bin 目录必须按目标架构选：x86_64 用 mingw64，i686 用 mingw32。都写死
+      # mingw64 会让 i686 找到 64 位 dlltool，报
+      # "dlltool could not create import library ... CreateProcess"（首次 CI 现象）。
       - name: Install MinGW
         run: |
           C:\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm ${{ matrix.msys }}"
-          echo "$env:C:\msys64\mingw64\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          echo "${{ matrix.bindir }}" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Install toolchain
         run: |
           rustup toolchain install stable --profile minimal
@@ -174,8 +211,15 @@ jobs:
         include:
           - arch: i686
             triple: i686-unknown-freebsd
+            tier3: false
+          # `armv6-unknown-freebsd` 是合法 target，但 stable 的 FreeBSD 工具链
+          # **没有它的预编译 std**（i686 有），`rustup target add` 因此失败：
+          #   "toolchain 'stable-x86_64-unknown-freebsd' has no prebuilt artifacts
+          #    available for target 'armv6-unknown-freebsd'"
+          # 只能 nightly + `-Z build-std`，见 plan §4.13 的 tier-3 处理。
           - arch: arm
             triple: armv6-unknown-freebsd
+            tier3: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -185,11 +229,24 @@ jobs:
           prepare: pkg install -y bash curl
           run: |
             set -e
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-            . "$HOME/.cargo/env"
-            rustup target add ${{ matrix.triple }}
-            cargo build --release -j 1 --target ${{ matrix.triple }} -p stowaway-agent
-            cargo build --release -j 1 --target ${{ matrix.triple }} -p stowaway-admin
+            if [ "${{ matrix.tier3 }}" = "true" ]; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain nightly
+              . "$HOME/.cargo/env"
+              rustup component add rust-src
+              # rust-toolchain.toml 钉的是 stable，必须用 RUSTUP_TOOLCHAIN 压过它，
+              # 否则就是「装了 nightly 却在跑 stable」（首次 CI 的 tier-3 假绿）。
+              export RUSTUP_TOOLCHAIN=nightly
+              BUILD_FLAGS="-Z build-std=std,panic_abort"
+            else
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              . "$HOME/.cargo/env"
+              rustup target add ${{ matrix.triple }}
+              BUILD_FLAGS=""
+            fi
+            cargo build --release -j 1 $BUILD_FLAGS --target ${{ matrix.triple }} -p stowaway-agent
+            cargo build --release -j 1 $BUILD_FLAGS --target ${{ matrix.triple }} -p stowaway-admin
+            ls -la target/${{ matrix.triple }}/release/stowaway-*
 
   # §8.6 第五、六条在 CI 上也必须跑：本地有 geiger 但 CI 没有，回退路径要验。
   extras:
