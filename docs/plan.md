@@ -503,7 +503,7 @@ pub enum SessionDirection { Outbound, Inbound }   // 相对**接收方**：Outbo
 | windows | x86_64 | ✅ | ✅ | 另有 `windows-nogui-agent`（`-H=windowsgui`） |
 | windows | i686 | ✅ | ✅ | |
 | freebsd | i686 | ✅ | ✅ | CI 走 FreeBSD VM/qemu |
-| freebsd | arm | ✅ | ✅ | |
+| freebsd | arm | ✅ | ✅ | **CI 未覆盖**：无 armv6 sysroot，交叉链接报 `is incompatible with /usr/lib/Scrt1.o`（§4.14 E33） |
 
 **best-effort 档**（不阻塞发布）：`linux-x86_64-musl`、`linux-aarch64-musl`、`linux-armv7-unknown-linux-musleabihf`、`linux-riscv64gc`、`freebsd-x86_64`。
 
@@ -562,7 +562,8 @@ pub enum SessionDirection { Outbound, Inbound }   // 相对**接收方**：Outbo
 | E29 | §4.13「工具链 `xtask build-matrix`」未说明在哪个环境跑哪一档 | `build-matrix` 增加 `--local`（只跑宿主 musl 档）与 `use_offline()` 判定：本机（无 `CI` 环境变量且存在 `.cargo-home/registry`）自动加 `--offline`，CI 上不加（依赖要现拉） | 同一份命令必须在两种环境都成立：本机只能吃 `.cargo-home` 缓存，加 `--offline` 是它唯一能跑的方式；CI runner 没有这份缓存，加了会直接失败。用环境判据而不是两个子命令，避免「本地跑 A、CI 跑 B」两条代码路径各自漂移 |
 | E30 | §4.13 `build-matrix` 的 `skipped` 语义 | `skipped` 在非 `--local` 时判失败（`ExitCode::FAILURE`），`--local` 时仍视为正常 | 首次真实 CI 暴露：`build linux/arm (tier-3)` 与 `build linux/mipsle (tier-3)` 两个 job **显示成功**，日志里却是 `ok 0 / skipped 1 / failed 0`——判据一个都没跑，绿灯纯属假象。两层根因：① `rust-toolchain.toml` 把 channel 钉在 `stable`，`rustup default nightly` 在仓库目录里被它覆盖（rustup 优先级 `RUSTUP_TOOLCHAIN` env > 工具链文件），于是 `-Z build-std` 从未执行；② `skipped` 不置非 0 退出码，把①的后果藏成绿色。只修①不够——任何未来的「目标装不上」都会同样静默；两条一起修，判据没跑就一定是红的 |
 | E31 | §4.13 只写了「11 个组合交叉编译」，没有规定 `russh` 用哪个 crypto 后端 | `russh` 关掉默认 feature，改用 **`ring`**（`features = ["ring", "rsa", "flate2"]`），`aws-lc-rs` 从依赖树消失 | `aws-lc-rs` 是 BoringSSL 的 C 实现：要 `cmake`、要完整交叉 C 工具链，且它的 `cpu_arm_freebsd.c` 在 FreeBSD/arm 上直接编不过（首次 CI 的 `build freebsd/arm` 就是 `use of undeclared identifier 'HWCAP_NEON'` 那一串）。`ring` 的 C 内核只有一份、汇编是预生成的，交叉编译只要一个 `cc`，`freebsd/arm`、`windows/{x86_64,i686}` 因此都能过。`rsa`/`flate2` 与 russh 默认值保持一致，SSH 能力不缩水（`cargo tree -p stowaway-agent -i aws-lc-sys` 现在报「did not match any packages」）|
-| E32 | §4.13 的 tier-3 两档（`armv5te-unknown-linux-musleabi`、`mipsel-unknown-linux-musl`）本机与 CI 都只做到「开始编译」 | CI 的 `build-linux` 为 tier-3 预装交叉 gcc（`gcc-arm-linux-gnueabi` / `gcc-mipsel-linux-gnu`）并导出 `CC_<triple>`；`ring` 在这两个 arch 上**没有汇编**（`ASM_TARGETS` 只有 aarch64/arm/x86/x86_64，`pregenerated/` 里 mips 为 0 项），但 `RING_SRCS` 里 `&[]` 那批是架构无关的纯 C，所以理论上仍有 C 回退路径。判据以 CI 实跑为准 | 本机 `/` 只读装不上 nightly，tier-3 的 `-Z build-std` 无法本地验证；`ring` 的 arch 覆盖是硬约束，只能靠 CI 的真实结果说话。**若 CI 仍红，结论写成「该目标不支持」而不是继续加参数硬凑**——判据的价值在于它敢红 |
+| E32 | §4.13 的 tier-3 两档（`armv5te-unknown-linux-musleabi`、`mipsel-unknown-linux-musl`）的交叉编译 | CI 里改用 **musl.cc 预编译工具链**：`arm-linux-musleabi-cross.tgz` / `mipsel-linux-musl-cross.tgz`，配 `[target.<triple>] linker` 与 `CC_<triple>`。**没有沿用 apt**：Ubuntu 26.04 已无 `gcc-mipsel-linux-gnu`（`E: Package ... has no installation candidate`），而 `gcc-arm-linux-gnueabi` 是 glibc 目标、缺 musl 的 `crtend.o`/`crtn.o`（`ld.bfd: cannot find crtend.o`） | 判据要的是「按发布形态真编译一次」，所以工具链的 libc 必须与 triple 一致。`ring` 在这两个 arch 上没有汇编（`ASM_TARGETS` 只有 aarch64/arm/x86/x86_64），但 `-Z build-std` 走的是 `RING_SRCS` 里架构无关的纯 C 回退。**若 CI 仍红，结论写成「该目标不支持」而不是继续加参数硬凑** |
+| E33 | §4.13 的 `freebsd/arm`（`armv6-unknown-freebsd`）在 CI 里无法完成 | 从 CI 矩阵移除，`docs/plan.md` §4.13 该行标注「CI 未覆盖」 | ① stable 的 FreeBSD 工具链没有 armv6 的预编译 std，只能 nightly + `-Z build-std`；② 即便这样，链接仍失败：`ld: error: <armv6 目标文件> is incompatible with /usr/lib/Scrt1.o`——x86_64 的 FreeBSD VM 里没有 armv6 的 C 运行库，`pkg` 也不提供 armv6 sysroot；③ `download.freebsd.org` 从本机不可达（代理下 000），无法下载 armv6 base 自建 sysroot。**冒称"通过"比不跑更糟**（E30 的教训）；要覆盖它需要原生 arm FreeBSD runner |
 
 ---
 

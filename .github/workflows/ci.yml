@@ -93,6 +93,7 @@ jobs:
             triple: x86_64-unknown-linux-gnu
             apt: ""
             linker: ""
+            xcc: ""
             cc_env: ""
             cc: ""
             tier3: false
@@ -108,17 +109,19 @@ jobs:
             tier3: false
           - arch: arm (tier-3)
             triple: armv5te-unknown-linux-musleabi
-            apt: gcc-arm-linux-gnueabi
-            linker: arm-linux-gnueabi-gcc
+            apt: ""
+            linker: arm-linux-musleabi-gcc
+            xcc: https://musl.cc/arm-linux-musleabi-cross.tgz
             cc_env: CC_armv5te_unknown_linux_musleabi
-            cc: arm-linux-gnueabi-gcc
+            cc: arm-linux-musleabi-gcc
             tier3: true
           - arch: mipsle (tier-3)
             triple: mipsel-unknown-linux-musl
-            apt: gcc-mipsel-linux-gnu
-            linker: mipsel-linux-gnu-gcc
+            apt: ""
+            linker: mipsel-linux-musl-gcc
+            xcc: https://musl.cc/mipsel-linux-musl-cross.tgz
             cc_env: CC_mipsel_unknown_linux_musl
-            cc: mipsel-linux-gnu-gcc
+            cc: mipsel-linux-musl-gcc
             tier3: true
     runs-on: ubuntu-latest
     steps:
@@ -139,18 +142,31 @@ jobs:
             rustup default stable
             rustup target add ${{ matrix.triple }}
           fi
-      # i686 只装 gcc-multilib，不写 linker：rustc 对 i686-unknown-linux-gnu 自己会传
-      # `-m32`，写 `linker = ""` 反而会让它报 "couldn't extract file stem from
-      # specified linker"（首次 CI 就是这条）。只有真需要指定交叉 gcc 时才写。
-      - name: Install cross linker
+      # tier-3 要 musl 交叉工具链：Ubuntu 26.04 已经没有 `gcc-mipsel-linux-gnu`
+      # （`E: Package ... has no installation candidate`），而 `gcc-arm-linux-gnueabi`
+      # 是 glibc 目标、缺 musl 的 `crtend.o`/`crtn.o`（`ld.bfd: cannot find crtend.o`）。
+      # musl.cc 的预编译包与 triple 的 libc 一致，解包即用。
+      - name: Install musl cross toolchain
+        if: matrix.xcc != ''
+        run: |
+          name=$(basename "${{ matrix.xcc }}" .tgz)
+          curl -sSL "${{ matrix.xcc }}" | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$name/bin" >> "$GITHUB_PATH"
+
+      - name: Install apt cross linker
         if: matrix.apt != ''
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt }}
-          if [ -n "${{ matrix.linker }}" ]; then
-            mkdir -p .cargo
-            printf '[target.%s]\nlinker = "%s"\n' "${{ matrix.triple }}" "${{ matrix.linker }}" >> .cargo/config.toml
-          fi
+
+      # i686 只装 gcc-multilib，不写 linker：rustc 对 i686-unknown-linux-gnu 自己会传
+      # `-m32`，写 `linker = ""` 反而会让它报 "couldn't extract file stem from
+      # specified linker"（首次 CI 就是这条）。只有 matrix.linker 非空时才写。
+      - name: Configure cross compiler
+        if: matrix.linker != ''
+        run: |
+          mkdir -p .cargo
+          printf '[target.%s]\nlinker = "%s"\n' "${{ matrix.triple }}" "${{ matrix.linker }}" >> .cargo/config.toml
           # `ring` 的 C 内核由 cc-rs 驱动，它按 `${CC_<triple>}` 找编译器；
           # 只配 linker 不够——cc-rs 会自己猜 `mipsel-linux-musl-gcc` 这种不存在的名字
           # （首次 CI 的 tier-3 就是 "failed to find tool \"mipsel-linux-musl-gcc\""）。
@@ -224,14 +240,13 @@ jobs:
           - arch: i686
             triple: i686-unknown-freebsd
             tier3: false
-          # `armv6-unknown-freebsd` 是合法 target，但 stable 的 FreeBSD 工具链
-          # **没有它的预编译 std**（i686 有），`rustup target add` 因此失败：
-          #   "toolchain 'stable-x86_64-unknown-freebsd' has no prebuilt artifacts
-          #    available for target 'armv6-unknown-freebsd'"
-          # 只能 nightly + `-Z build-std`，见 plan §4.13 的 tier-3 处理。
-          - arch: arm
-            triple: armv6-unknown-freebsd
-            tier3: true
+          # freebsd/arm（`armv6-unknown-freebsd`）**不在 CI 矩阵里**：
+          # ① stable 的 FreeBSD 工具链没有它的预编译 std，只能 nightly + `-Z build-std`；
+          # ② 即便这样，最后的链接仍在 x86_64 的 FreeBSD VM 里失败——
+          #   `ld: error: <armv6 目标文件> is incompatible with /usr/lib/Scrt1.o`
+          #   （VM 里没有 armv6 的 C 运行库/头文件，`pkg` 也不提供 armv6 sysroot）。
+          # 该组合需要原生 arm 的 FreeBSD runner 或 armv6 sysroot，属 plan §4.14 E33
+          # 记录的已知限制；冒称"通过"比不跑更糟（E30 的教训）。
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
