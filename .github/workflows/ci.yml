@@ -94,6 +94,7 @@ jobs:
             apt: ""
             linker: ""
             xcc: ""
+            xcc_dir: ""
             cc_env: ""
             cc: ""
             tier3: false
@@ -101,27 +102,37 @@ jobs:
             triple: i686-unknown-linux-gnu
             apt: gcc-multilib
             linker: ""
+            xcc: ""
+            xcc_dir: ""
+            cc_env: ""
+            cc: ""
             tier3: false
           - arch: aarch64
             triple: aarch64-unknown-linux-gnu
             apt: gcc-aarch64-linux-gnu
             linker: aarch64-linux-gnu-gcc
+            xcc: ""
+            xcc_dir: ""
+            cc_env: ""
+            cc: ""
             tier3: false
           - arch: arm (tier-3)
             triple: armv5te-unknown-linux-musleabi
             apt: ""
-            linker: arm-linux-musleabi-gcc
-            xcc: https://musl.cc/arm-linux-musleabi-cross.tgz
+            linker: arm-buildroot-linux-musleabi-gcc
+            xcc: https://toolchains.bootlin.com/downloads/releases/toolchains/armv5-eabi/tarballs/armv5-eabi--musl--stable-2024.02-1.tar.bz2
+            xcc_dir: armv5-eabi--musl--stable-2024.02-1
             cc_env: CC_armv5te_unknown_linux_musleabi
-            cc: arm-linux-musleabi-gcc
+            cc: arm-buildroot-linux-musleabi-gcc
             tier3: true
           - arch: mipsle (tier-3)
             triple: mipsel-unknown-linux-musl
             apt: ""
-            linker: mipsel-linux-musl-gcc
-            xcc: https://musl.cc/mipsel-linux-musl-cross.tgz
+            linker: mipsel-buildroot-linux-musl-gcc
+            xcc: https://toolchains.bootlin.com/downloads/releases/toolchains/mips32el/tarballs/mips32el--musl--stable-2024.02-1.tar.bz2
+            xcc_dir: mips32el--musl--stable-2024.02-1
             cc_env: CC_mipsel_unknown_linux_musl
-            cc: mipsel-linux-musl-gcc
+            cc: mipsel-buildroot-linux-musl-gcc
             tier3: true
     runs-on: ubuntu-latest
     steps:
@@ -142,16 +153,20 @@ jobs:
             rustup default stable
             rustup target add ${{ matrix.triple }}
           fi
-      # tier-3 要 musl 交叉工具链：Ubuntu 26.04 已经没有 `gcc-mipsel-linux-gnu`
-      # （`E: Package ... has no installation candidate`），而 `gcc-arm-linux-gnueabi`
-      # 是 glibc 目标、缺 musl 的 `crtend.o`/`crtn.o`（`ld.bfd: cannot find crtend.o`）。
-      # musl.cc 的预编译包与 triple 的 libc 一致，解包即用。
+      # tier-3 要 musl 交叉工具链，三条路都试过：
+      # ① apt：Ubuntu 26.04 已无 `gcc-mipsel-linux-gnu`（`E: Package ... has no
+      #    installation candidate`）；`gcc-arm-linux-gnueabi` 是 glibc 目标，缺 musl 的
+      #    `crtend.o`/`crtn.o`（`ld.bfd: cannot find crtend.o` → `ld returned 1`）。
+      # ② musl.cc：包是对的，但**从 GitHub runner 连不上**——`curl: (28) Failed to
+      #    connect to musl.cc port 443 after 135502 ms`。
+      # ③ Bootlin：可达、体积相近（~130MB），且是 buildroot 出的完整 sysroot
+      #    （`crt{1,i,n}.o` + `lib/gcc/*/crt{begin,end}.o` 齐备），与 triple 的 libc 一致。
       - name: Install musl cross toolchain
         if: matrix.xcc != ''
         run: |
-          name=$(basename "${{ matrix.xcc }}" .tgz)
-          curl -sSL "${{ matrix.xcc }}" | tar -xz -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/$name/bin" >> "$GITHUB_PATH"
+          curl -sSL -o "$RUNNER_TEMP/xcc.tar.bz2" "${{ matrix.xcc }}"
+          tar -xjf "$RUNNER_TEMP/xcc.tar.bz2" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/${{ matrix.xcc_dir }}/bin" >> "$GITHUB_PATH"
 
       - name: Install apt cross linker
         if: matrix.apt != ''
