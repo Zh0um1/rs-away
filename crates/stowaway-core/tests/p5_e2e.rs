@@ -186,6 +186,7 @@ struct LocalSshd {
     port: u16,
     dir: PathBuf,
     user_key: PathBuf,
+    user: String,
 }
 
 impl LocalSshd {
@@ -204,7 +205,7 @@ impl LocalSshd {
         std::fs::create_dir_all(&dir).ok()?;
 
         let host = dir.join("hostkey");
-        let user = dir.join("userkey");
+        let user_key_path = dir.join("userkey");
         let make_key = |path: &Path| {
             Command::new("/usr/bin/ssh-keygen")
                 .args(["-q", "-t", "ed25519", "-N", "", "-f"])
@@ -213,13 +214,17 @@ impl LocalSshd {
                 .stderr(Stdio::null())
                 .status()
         };
-        if !make_key(&host).ok()?.success() || !make_key(&user).ok()?.success() {
+        if !make_key(&host).ok()?.success() || !make_key(&user_key_path).ok()?.success() {
             return None;
         }
 
         let authorized = dir.join("authorized_keys");
         std::fs::copy(dir.join("userkey.pub"), &authorized).ok()?;
 
+        // 用运行测试的那个账号登录，不假设是 root：CI runner 上是 `runner`，
+        // 本地开发机上通常是 `root`。写死任一个都会在另一侧失败在
+        // `Auth("用户 X 的凭据未被接受")`——`p5_e2e` 曾在 GitHub runner 上正是如此。
+        let user = current_user().unwrap_or_else(|| "root".to_owned());
         let port = pick_free_port()?;
         let config = dir.join("sshd_config");
         std::fs::write(
@@ -234,6 +239,7 @@ impl LocalSshd {
                  PermitRootLogin prohibit-password\n\
                  UsePAM no\n\
                  StrictModes no\n\
+                 AllowUsers {user}\n\
                  LogLevel VERBOSE\n",
                 host.display(),
                 dir.join("sshd.pid").display(),
@@ -260,7 +266,8 @@ impl LocalSshd {
                     child,
                     port,
                     dir,
-                    user_key: user,
+                    user_key: user_key_path,
+                    user,
                 });
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -271,7 +278,7 @@ impl LocalSshd {
     fn ssh_param(&self) -> ProtoSshParam {
         let pem = std::fs::read_to_string(&self.user_key).expect("user key pem");
         ProtoSshParam {
-            user: "root".to_owned(),
+            user: self.user.clone(),
             auth: SshAuth::PrivateKey(pem),
             command: String::new(),
         }
@@ -296,6 +303,27 @@ fn pick_free_port() -> Option<u16> {
     let port = s.local_addr().ok()?.port();
     drop(s);
     Some(port)
+}
+
+/// 当前进程所属账号名。测试用 `sshd` 只允许这个账号登录：CI runner 上是
+/// `runner`，开发机上通常是 `root`。取不到就返回 `None`（调用方回落到
+/// `root`，那是本地开发的常态）。
+fn current_user() -> Option<String> {
+    let uid = {
+        let out = Command::new("id").arg("-u").output().ok()?;
+        String::from_utf8(out.stdout).ok()?.trim().to_owned()
+    };
+    let out = Command::new("getent")
+        .arg("passwd")
+        .arg(&uid)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8(out.stdout).ok()?;
+    let name = line.split(':').next()?.trim().to_owned();
+    if name.is_empty() { None } else { Some(name) }
 }
 
 /// 场景 8a：SSH 命令执行（真 sshd + 公钥认证 + known_hosts 首访学习）。

@@ -49,7 +49,7 @@ jobs:
       - name: Checkout Go baseline
         uses: actions/checkout@v4
         with:
-          repository: ph4ntom11235/Stowaway
+          repository: ph4ntonn/Stowaway
           path: baseline/stowaway
           # 基线 HEAD 见 docs/plan.md 首页；升级基线必须同步改文档后再改这里。
           ref: 7f715be
