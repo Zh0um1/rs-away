@@ -97,6 +97,7 @@ jobs:
             xcc_dir: ""
             cc_env: ""
             cc: ""
+            rflags_env: ""
             tier3: false
           - arch: i686
             triple: i686-unknown-linux-gnu
@@ -106,6 +107,7 @@ jobs:
             xcc_dir: ""
             cc_env: ""
             cc: ""
+            rflags_env: ""
             tier3: false
           - arch: aarch64
             triple: aarch64-unknown-linux-gnu
@@ -115,6 +117,7 @@ jobs:
             xcc_dir: ""
             cc_env: ""
             cc: ""
+            rflags_env: ""
             tier3: false
           - arch: arm (tier-3)
             triple: armv5te-unknown-linux-musleabi
@@ -124,6 +127,7 @@ jobs:
             xcc_dir: armv5-eabi--musl--stable-2024.02-1
             cc_env: CC_armv5te_unknown_linux_musleabi
             cc: arm-buildroot-linux-musleabi-gcc
+            rflags_env: CARGO_TARGET_ARMV5TE_UNKNOWN_LINUX_MUSLEABI_RUSTFLAGS
             tier3: true
           - arch: mipsle (tier-3)
             triple: mipsel-unknown-linux-musl
@@ -133,6 +137,7 @@ jobs:
             xcc_dir: mips32el--musl--stable-2024.02-1
             cc_env: CC_mipsel_unknown_linux_musl
             cc: mipsel-buildroot-linux-musl-gcc
+            rflags_env: CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_RUSTFLAGS
             tier3: true
     runs-on: ubuntu-latest
     steps:
@@ -176,6 +181,8 @@ jobs:
           if [ -n "$glib" ] && [ ! -e "$(dirname "$glib")/libunwind.a" ]; then
             ln -s libgcc_eh.a "$(dirname "$glib")/libunwind.a"
           fi
+          # 静态链接（下面 Configure cross compiler 里的 `+crt-static`）会让 mips 的
+          # 链接行也带上 `-lunwind`，所以这条符号链接两档都需要，不只是 arm。
 
       - name: Install apt cross linker
         if: matrix.apt != ''
@@ -196,6 +203,18 @@ jobs:
           # （首次 CI 的 tier-3 就是 "failed to find tool \"mipsel-linux-musl-gcc\""）。
           if [ -n "${{ matrix.cc_env }}" ]; then
             echo "${{ matrix.cc_env }}=${{ matrix.cc }}" >> "$GITHUB_ENV"
+          fi
+          # tier-3 必须显式静态 + 关掉 rustc 自带的「self-contained」起始文件：
+          # `rustc --print target-spec-json` 显示 armv5te 的 spec 里
+          # `crt-static-default = true`，rustc 于是自己传 `-nostartfiles` 并逐个点名
+          # 裸文件名 `crt1.o`/`crti.o`/`crtbegin.o`。而 GNU ld 的 `-L` **只查库不查
+          # 目标文件**（实测：`ld -L<dir> crt1.o` 仍报 cannot find，换成绝对路径才行），
+          # Bootlin 的 crt 文件在 sysroot/lib 而不在 ld 的默认搜索目录里，于是
+          # `ld: cannot find crt1.o`。关掉 self-contained 后起始文件交回 gcc 驱动，
+          # 它知道自己的 sysroot；`+crt-static` 则保证产物是静态 musl
+          # （实测：不加它 mips 出的是 PIE + INTERP + NEEDED libc.so，不是发布形态）。
+          if [ -n "${{ matrix.rflags_env }}" ]; then
+            echo "${{ matrix.rflags_env }}=-C target-feature=+crt-static -C link-self-contained=no" >> "$GITHUB_ENV"
           fi
       - uses: Swatinem/rust-cache@v2
       - name: build

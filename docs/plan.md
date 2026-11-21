@@ -496,8 +496,8 @@ pub enum SessionDirection { Outbound, Inbound }   // 相对**接收方**：Outbo
 | linux | x86_64 | ✅ | ✅ | `x86_64-unknown-linux-gnu`（musl 版列 best-effort） |
 | linux | i686 | ✅ | ✅ | `i686-unknown-linux-gnu`，需 32 位链接器 |
 | linux | aarch64 | ✅ | ✅ | |
-| linux | arm（GOARM=5） | ✅ | ❌ | 对应 `armv5te-unknown-linux-musleabi`，**tier-3**：`-Z build-std` + nightly + 关 TLS/ws/kcp |
-| linux | mipsle | ✅ | ❌ | `mipsel-unknown-linux-musl`，**tier-3**：同上 |
+| linux | arm（GOARM=5） | ✅ | ❌ | 对应 `armv5te-unknown-linux-musleabi`，**tier-3**：`-Z build-std` + nightly + Bootlin musl 工具链；**TLS/ws/kcp 不需要关**（ring 有纯 C 回退，见 E32 与 §9 风险表）|
+| linux | mipsle | ✅ | ❌ | `mipsel-unknown-linux-musl`，**tier-3**：同上（`+crt-static` 才能出静态发布形态，见 E32）|
 | darwin | x86_64 | ✅ | ✅ | |
 | darwin | aarch64 | ✅ | ✅ | |
 | windows | x86_64 | ✅ | ✅ | 另有 `windows-nogui-agent`（`-H=windowsgui`） |
@@ -562,7 +562,7 @@ pub enum SessionDirection { Outbound, Inbound }   // 相对**接收方**：Outbo
 | E29 | §4.13「工具链 `xtask build-matrix`」未说明在哪个环境跑哪一档 | `build-matrix` 增加 `--local`（只跑宿主 musl 档）与 `use_offline()` 判定：本机（无 `CI` 环境变量且存在 `.cargo-home/registry`）自动加 `--offline`，CI 上不加（依赖要现拉） | 同一份命令必须在两种环境都成立：本机只能吃 `.cargo-home` 缓存，加 `--offline` 是它唯一能跑的方式；CI runner 没有这份缓存，加了会直接失败。用环境判据而不是两个子命令，避免「本地跑 A、CI 跑 B」两条代码路径各自漂移 |
 | E30 | §4.13 `build-matrix` 的 `skipped` 语义 | `skipped` 在非 `--local` 时判失败（`ExitCode::FAILURE`），`--local` 时仍视为正常 | 首次真实 CI 暴露：`build linux/arm (tier-3)` 与 `build linux/mipsle (tier-3)` 两个 job **显示成功**，日志里却是 `ok 0 / skipped 1 / failed 0`——判据一个都没跑，绿灯纯属假象。两层根因：① `rust-toolchain.toml` 把 channel 钉在 `stable`，`rustup default nightly` 在仓库目录里被它覆盖（rustup 优先级 `RUSTUP_TOOLCHAIN` env > 工具链文件），于是 `-Z build-std` 从未执行；② `skipped` 不置非 0 退出码，把①的后果藏成绿色。只修①不够——任何未来的「目标装不上」都会同样静默；两条一起修，判据没跑就一定是红的 |
 | E31 | §4.13 只写了「11 个组合交叉编译」，没有规定 `russh` 用哪个 crypto 后端 | `russh` 关掉默认 feature，改用 **`ring`**（`features = ["ring", "rsa", "flate2"]`），`aws-lc-rs` 从依赖树消失 | `aws-lc-rs` 是 BoringSSL 的 C 实现：要 `cmake`、要完整交叉 C 工具链，且它的 `cpu_arm_freebsd.c` 在 FreeBSD/arm 上直接编不过（首次 CI 的 `build freebsd/arm` 就是 `use of undeclared identifier 'HWCAP_NEON'` 那一串）。`ring` 的 C 内核只有一份、汇编是预生成的，交叉编译只要一个 `cc`，`freebsd/arm`、`windows/{x86_64,i686}` 因此都能过。`rsa`/`flate2` 与 russh 默认值保持一致，SSH 能力不缩水（`cargo tree -p stowaway-agent -i aws-lc-sys` 现在报「did not match any packages」）|
-| E32 | §4.13 的 tier-3 两档（`armv5te-unknown-linux-musleabi`、`mipsel-unknown-linux-musl`）的交叉编译 | CI 里改用 **musl.cc 预编译工具链**：`arm-linux-musleabi-cross.tgz` / `mipsel-linux-musl-cross.tgz`，配 `[target.<triple>] linker` 与 `CC_<triple>`。**没有沿用 apt**：Ubuntu 26.04 已无 `gcc-mipsel-linux-gnu`（`E: Package ... has no installation candidate`），而 `gcc-arm-linux-gnueabi` 是 glibc 目标、缺 musl 的 `crtend.o`/`crtn.o`（`ld.bfd: cannot find crtend.o`） | 判据要的是「按发布形态真编译一次」，所以工具链的 libc 必须与 triple 一致。`ring` 在这两个 arch 上没有汇编（`ASM_TARGETS` 只有 aarch64/arm/x86/x86_64），但 `-Z build-std` 走的是 `RING_SRCS` 里架构无关的纯 C 回退。**若 CI 仍红，结论写成「该目标不支持」而不是继续加参数硬凑** |
+| E32 | §4.13 的 tier-3 两档（`armv5te-unknown-linux-musleabi`、`mipsel-unknown-linux-musl`）的交叉编译 | CI 用 **Bootlin 预编译 musl 工具链**（`armv5-eabi--musl--stable-2024.02-1`、`mips32el--musl--stable-2024.02-1`），并给两档加 **按目标限定的 RUSTFLAGS** `-C target-feature=+crt-static -C link-self-contained=no`；工具链里补一条 `libunwind.a -> libgcc_eh.a` 符号链接 | 四条路依次排除：① apt——Ubuntu 26.04 已无 `gcc-mipsel-linux-gnu`（`E: Package ... has no installation candidate`），而 `gcc-arm-linux-gnueabi` 是 glibc 目标、缺 musl 的 `crtend.o`/`crtn.o`；② musl.cc——包是对的，但**从 GitHub runner 连不上**（`curl: (28) Failed to connect to musl.cc port 443 after 135502 ms`）；③ Bootlin 能编 mips（首绿），arm 仍报 `ld: cannot find crt1.o/crti.o/crtbegin.o/-lunwind/crtend.o/crtn.o`；④ 补 `crt*.o` 符号链接——**无效**，因为 GNU ld 的 `-L` 只查库不查裸目标文件（实测 `ld -L<dir> crt1.o` 仍报错，绝对路径才行）。真因是 `armv5te-unknown-linux-musl` 的 target spec 有 `crt-static-default = true`，rustc 于是自己传 `-nostartfiles` 并逐个点名裸 `crt*.o`；mips 的 spec 没有该位，所以走 gcc 驱动的动态路径（这也解释了为什么只有 arm 报 `-lunwind`——**两份工具链都没有 libunwind**，`-print-file-name=libunwind.a` 在 mips 上原样回显，是 mips 的链接行压根不传该 flag）。`-C link-self-contained=no` 把起始文件交回 gcc 驱动（它知道自己的 sysroot），`+crt-static` 保证产物是静态 musl。实测产物：arm `Finished 4m15s`、mips `Finished 1m03s`，两者 `file` 均为 `ELF 32-bit LSB executable` 且 **INTERP=0 / NEEDED=0**；不加 `+crt-static` 的 mips 出的是 `DYN (PIE)` + `NEEDED [libgcc_s.so.1, libc.so]`，不是发布形态。**若 CI 仍红，结论写成「该目标不支持」而不是继续加参数硬凑** |
 | E33 | §4.13 的 `freebsd/arm`（`armv6-unknown-freebsd`）在 CI 里无法完成 | 从 CI 矩阵移除，`docs/plan.md` §4.13 该行标注「CI 未覆盖」 | ① stable 的 FreeBSD 工具链没有 armv6 的预编译 std，只能 nightly + `-Z build-std`；② 即便这样，链接仍失败：`ld: error: <armv6 目标文件> is incompatible with /usr/lib/Scrt1.o`——x86_64 的 FreeBSD VM 里没有 armv6 的 C 运行库，`pkg` 也不提供 armv6 sysroot；③ `download.freebsd.org` 从本机不可达（代理下 000），无法下载 armv6 base 自建 sysroot。**冒称"通过"比不跑更糟**（E30 的教训）；要覆盖它需要原生 arm FreeBSD runner |
 
 ---
@@ -783,7 +783,7 @@ cargo xtask no-unsafe                     # 协议/加密/传输三 crate 的 un
 | 风险 | 影响 | 缓解 |
 |---|---|---|
 | v2 与 v1 不互通导致无法渐进迁移 | 升级需全量切换 | 明确写入 §0；提供 `tests/interop` 行为对照证明能力未退化 |
-| tier-3 目标（armv5te / mipsel）无 `target_has_atomic="64"`，`ring`/`aws-lc-rs` 不可用 | 这两平台无法出 TLS 包 | feature 门控：关 `tls`/`transport-ws`/`transport-kcp`，只留 `transport-raw`（§4.13） |
+| ~~tier-3 目标（armv5te / mipsel）无 `target_has_atomic="64"`，`ring`/`aws-lc-rs` 不可用~~ **已实测推翻** | 原本预计这两平台无法出 TLS 包 | 实测 `max-atomic-width = 32` 且 `atomic-cas = None` 并不妨碍 `ring` 编译：无汇编目标时它回退到 `RING_SRCS` 里架构无关的纯 C（产物里能看到 `aes_nohw.c`/`aes_nohw_encrypt_batch` 符号，以及完整的 `TLS13_AES_256_GCM_SHA384` 等密码套件字符串），CI 的 armv5te 缓存按默认 feature 全开就编过了。**结论：tier-3 保留 TLS/ws，不需要为此做 feature 门控**（E32 已记）13） |
 | `tokio_kcp 0.9.8` 自 2024-07 未更新，内部 `kcp 0.5.3` 与独立 `kcp 0.6.0` 非同源 | 后续需自维护 fork | KCP 默认关闭；接口隔离在 `transport/kcp` 单模块内 |
 | UDP 受中间设备 QoS/限速影响 | KCP 在这些网络下反而更差 | 保留 raw/ws 为默认；KCP 需显式开启 |
 | `ratatui` 在无 TTY 环境不可用 | 自动化测试受阻 | `--non-interactive` / `--command`（§4.10） |
