@@ -176,12 +176,17 @@ jobs:
       # mipsel 用 cargo-zigbuild：zig 自带完整 libc，裸跑即 `static-pie linked`
       # 且无 INTERP——比 cross 在该目标上出的动态 PIE 更接近发布形态。
       # cross 在该目标上一加静态化就红在 `crt*.o`/`-lunwind`，与 Bootlin 同一件事。
+      # cargo-zigbuild 只有一个 `cargo-zigbuild` 二进制，由 cargo 的子命令分派调用；
+      # 它把任何未知参数当错误（`cargo zigbuild --version` → "unexpected argument
+      # '--version' found" + exit 2），所以探测要用 `--help`。zig 本身用 `-m ziglang`
+      # 调，避免依赖 pip 是否把 `zig` 也放进了 PATH。
       - name: Install zigbuild
         if: matrix.builder == 'zigbuild'
         run: |
           pip install --quiet ziglang cargo-zigbuild
-          python3 -m ziglang version || zig version
-          cargo zigbuild --version
+          python3 -m ziglang version
+          cargo zigbuild --help > /dev/null
+          echo "zigbuild 就绪"
 
       - name: Install apt cross linker
         if: matrix.apt != ''

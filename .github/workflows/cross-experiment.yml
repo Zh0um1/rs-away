@@ -196,8 +196,9 @@ jobs:
       - name: Install zig + cargo-zigbuild
         run: |
           pip install --quiet ziglang cargo-zigbuild
-          python3 -m ziglang version || zig version
-          cargo zigbuild --version || true
+          python3 -m ziglang version
+          # cargo-zigbuild 把未知参数当错误，`--version` 会 exit 2（首轮 ci.yml 踩过）。
+          cargo zigbuild --help > /dev/null
 
       # zig 的链接目标语法是 `<triple>.<glibc 版本>`，musl 目标写
       # `<triple>` 即可（musl 不需要 glibc 版本），这里两种都试。
