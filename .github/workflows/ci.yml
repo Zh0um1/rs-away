@@ -13,6 +13,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # cross 的预编译包版本（plan §4.14 E34）。
+  CROSS_VERSION: "0.2.5"
   # 与 Cargo.toml 的 rust-version 对齐；本机 dev 环境因 / 只读只能用 stable（见 plan §4.2）。
   MSRV: "1.89.0"
 
@@ -95,51 +97,44 @@ jobs:
             triple: x86_64-unknown-linux-gnu
             apt: ""
             linker: ""
-            xcc: ""
-            xcc_dir: ""
             cc_env: ""
             cc: ""
-            rflags_env: ""
+            builder: cargo
             tier3: false
           - arch: i686
             triple: i686-unknown-linux-gnu
             apt: gcc-multilib
             linker: ""
-            xcc: ""
-            xcc_dir: ""
             cc_env: ""
             cc: ""
-            rflags_env: ""
+            builder: cargo
             tier3: false
           - arch: aarch64
             triple: aarch64-unknown-linux-gnu
             apt: gcc-aarch64-linux-gnu
             linker: aarch64-linux-gnu-gcc
-            xcc: ""
-            xcc_dir: ""
             cc_env: ""
             cc: ""
-            rflags_env: ""
+            builder: cargo
             tier3: false
+          # tier-3 两档各用不同的驱动器，依据是同一次实验的实测结果（plan §4.14 E34）：
+          # 同一套 RUSTFLAGS 在两种 sysroot 上方向相反，所以不追求「统一配方」，
+          # 而是各选一个能出静态发布形态的工具。
           - arch: arm (tier-3)
             triple: armv5te-unknown-linux-musleabi
             apt: ""
-            linker: arm-buildroot-linux-musleabi-gcc
-            xcc: https://toolchains.bootlin.com/downloads/releases/toolchains/armv5-eabi/tarballs/armv5-eabi--musl--stable-2024.02-1.tar.bz2
-            xcc_dir: armv5-eabi--musl--stable-2024.02-1
-            cc_env: CC_armv5te_unknown_linux_musleabi
-            cc: arm-buildroot-linux-musleabi-gcc
-            rflags_env: CARGO_TARGET_ARMV5TE_UNKNOWN_LINUX_MUSLEABI_RUSTFLAGS
+            linker: ""
+            cc_env: ""
+            cc: ""
+            builder: cross
             tier3: true
           - arch: mipsle (tier-3)
             triple: mipsel-unknown-linux-musl
             apt: ""
-            linker: mipsel-buildroot-linux-musl-gcc
-            xcc: https://toolchains.bootlin.com/downloads/releases/toolchains/mips32el/tarballs/mips32el--musl--stable-2024.02-1.tar.bz2
-            xcc_dir: mips32el--musl--stable-2024.02-1
-            cc_env: CC_mipsel_unknown_linux_musl
-            cc: mipsel-buildroot-linux-musl-gcc
-            rflags_env: CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_RUSTFLAGS
+            linker: ""
+            cc_env: ""
+            cc: ""
+            builder: zigbuild
             tier3: true
     runs-on: ubuntu-latest
     steps:
@@ -160,42 +155,33 @@ jobs:
             rustup default stable
             rustup target add ${{ matrix.triple }}
           fi
-      # tier-3 要 musl 交叉工具链，三条路都试过：
-      # ① apt：Ubuntu 26.04 已无 `gcc-mipsel-linux-gnu`（`E: Package ... has no
-      #    installation candidate`）；`gcc-arm-linux-gnueabi` 是 glibc 目标，缺 musl 的
-      #    `crtend.o`/`crtn.o`（`ld.bfd: cannot find crtend.o` → `ld returned 1`）。
-      # ② musl.cc：包是对的，但**从 GitHub runner 连不上**——`curl: (28) Failed to
-      #    connect to musl.cc port 443 after 135502 ms`。
-      # ③ Bootlin：可达、体积相近（~130MB），且是 buildroot 出的完整 sysroot
-      #    （`crt{1,i,n}.o` + `lib/gcc/*/crt{begin,end}.o` 齐备），与 triple 的 libc 一致。
-      - name: Install musl cross toolchain
-        if: matrix.xcc != ''
+
+      # armv5te 用 cross：容器里的 crosstool-ng sysroot 让 rustc **默认的**
+      # self-contained 模式就能找到全部 `crt*.o` 与 unwind 件，裸跑即静态 EXEC
+      # （实测 `statically linked`、无 INTERP、7.5MB）。任何 RUSTFLAGS 都不需要。
+      - name: Install cross
+        if: matrix.builder == 'cross'
         run: |
-          curl -sSL -o "$RUNNER_TEMP/xcc.tar.bz2" "${{ matrix.xcc }}"
-          tar -xjf "$RUNNER_TEMP/xcc.tar.bz2" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/${{ matrix.xcc_dir }}/bin" >> "$GITHUB_PATH"
-          # `-Z build-std` 的 armv5te 链接行里 rustc 会传 `-lunwind`（aarch64/arm 走
-          # libunwind，mips 不走），而 Bootlin 的 sysroot 只装 `libgcc_eh.a` ——
-          # 两者提供同一套 `_Unwind_*`，`libgcc_eh.a` 就是 GCC 自带的 unwind 实现。
-          # 实测：`gcc -lunwind -static` 在有该符号链接时能出正确 ELF，缺了则
-          # `ld: cannot find -lunwind`（本轮 CI 的 arm 失败点）。
-          # `-maxdepth` 必须够深：真实路径是 `lib/gcc/<triple>/<version>/libgcc_eh.a`，
-          # 相对 `lib/gcc` 是第 3 层。写 `-maxdepth 2` 会 find 不到、`if` 恒假、
-          # 符号链接从未建出来（本机曾因手工建过一次而误判为已生效）。
-          glib=$(find "$RUNNER_TEMP/${{ matrix.xcc_dir }}/lib/gcc" -name libgcc_eh.a | head -1)
-          if [ -z "$glib" ]; then
-            echo "::error::在 ${{ matrix.xcc_dir }} 里找不到 libgcc_eh.a，无法补 libunwind.a（布局变了？）"
-            exit 1
-          fi
-          if [ ! -e "$(dirname "$glib")/libunwind.a" ]; then
-            ln -s libgcc_eh.a "$(dirname "$glib")/libunwind.a"
-          fi
-          if [ ! -e "$(dirname "$glib")/libunwind.a" ]; then
-            echo "::error::libunwind.a 符号链接没建出来：$(dirname "$glib")"
-            exit 1
-          fi
-          # 静态链接（下面 Configure cross compiler 里的 `+crt-static`）会让 mips 的
-          # 链接行也带上 `-lunwind`，所以这条符号链接两档都需要，不只是 arm。
+          curl -sSL -o "$RUNNER_TEMP/cross.tgz" \
+            "https://github.com/cross-rs/cross/releases/download/v${CROSS_VERSION}/cross-x86_64-unknown-linux-gnu.tar.gz"
+          tar -xzf "$RUNNER_TEMP/cross.tgz" -C "$RUNNER_TEMP"
+          chmod +x "$RUNNER_TEMP/cross"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cross" --version
+          # cross 只把 `CARGO_*` / `CROSS_*` 开头的变量传进容器，`RUSTUP_TOOLCHAIN`
+          # 不在其中 → 容器内会退回工具链文件里的 stable，`-Z build-std` 报
+          # "the option `Z` is only accepted on the nightly compiler"。必须显式传。
+          echo "CROSS_CONTAINER_OPTS=--env RUSTUP_TOOLCHAIN=nightly" >> "$GITHUB_ENV"
+
+      # mipsel 用 cargo-zigbuild：zig 自带完整 libc，裸跑即 `static-pie linked`
+      # 且无 INTERP——比 cross 在该目标上出的动态 PIE 更接近发布形态。
+      # cross 在该目标上一加静态化就红在 `crt*.o`/`-lunwind`，与 Bootlin 同一件事。
+      - name: Install zigbuild
+        if: matrix.builder == 'zigbuild'
+        run: |
+          pip install --quiet ziglang cargo-zigbuild
+          python3 -m ziglang version || zig version
+          cargo zigbuild --version
 
       - name: Install apt cross linker
         if: matrix.apt != ''
@@ -206,32 +192,19 @@ jobs:
       # i686 只装 gcc-multilib，不写 linker：rustc 对 i686-unknown-linux-gnu 自己会传
       # `-m32`，写 `linker = ""` 反而会让它报 "couldn't extract file stem from
       # specified linker"（首次 CI 就是这条）。只有 matrix.linker 非空时才写。
+      # tier-3 两档都不写：linker 由 cross 镜像 / zig wrapper 自带。
       - name: Configure cross compiler
         if: matrix.linker != ''
         run: |
           mkdir -p .cargo
           printf '[target.%s]\nlinker = "%s"\n' "${{ matrix.triple }}" "${{ matrix.linker }}" >> .cargo/config.toml
-          # `ring` 的 C 内核由 cc-rs 驱动，它按 `${CC_<triple>}` 找编译器；
-          # 只配 linker 不够——cc-rs 会自己猜 `mipsel-linux-musl-gcc` 这种不存在的名字
-          # （首次 CI 的 tier-3 就是 "failed to find tool \"mipsel-linux-musl-gcc\""）。
           if [ -n "${{ matrix.cc_env }}" ]; then
             echo "${{ matrix.cc_env }}=${{ matrix.cc }}" >> "$GITHUB_ENV"
-          fi
-          # tier-3 必须显式静态 + 关掉 rustc 自带的「self-contained」起始文件：
-          # `rustc --print target-spec-json` 显示 armv5te 的 spec 里
-          # `crt-static-default = true`，rustc 于是自己传 `-nostartfiles` 并逐个点名
-          # 裸文件名 `crt1.o`/`crti.o`/`crtbegin.o`。而 GNU ld 的 `-L` **只查库不查
-          # 目标文件**（实测：`ld -L<dir> crt1.o` 仍报 cannot find，换成绝对路径才行），
-          # Bootlin 的 crt 文件在 sysroot/lib 而不在 ld 的默认搜索目录里，于是
-          # `ld: cannot find crt1.o`。关掉 self-contained 后起始文件交回 gcc 驱动，
-          # 它知道自己的 sysroot；`+crt-static` 则保证产物是静态 musl
-          # （实测：不加它 mips 出的是 PIE + INTERP + NEEDED libc.so，不是发布形态）。
-          if [ -n "${{ matrix.rflags_env }}" ]; then
-            echo "${{ matrix.rflags_env }}=-C target-feature=+crt-static -C link-self-contained=no" >> "$GITHUB_ENV"
           fi
       - uses: Swatinem/rust-cache@v2
       - name: build
         run: cargo run -q -p xtask -- build-matrix --target ${{ matrix.triple }}
+
 
   build-darwin:
     name: build darwin/${{ matrix.arch }}
