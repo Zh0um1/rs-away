@@ -97,8 +97,8 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          CROSS_CONTAINER_OPTS="--env RUSTUP_TOOLCHAIN=nightly" \
-          "CARGO_TARGET_${{ matrix.rflags }}_RUSTFLAGS=-C link-self-contained=no" \
+          export CROSS_CONTAINER_OPTS="--env RUSTUP_TOOLCHAIN=nightly"
+          export "CARGO_TARGET_${{ matrix.rflags }}_RUSTFLAGS=-C link-self-contained=no"
           "$RUNNER_TEMP/cross" build --release \
             --target ${{ matrix.triple }} -p ${{ matrix.pkg }} \
             $ZFLAGS 2>&1 | tee selfless.log
@@ -109,8 +109,8 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          CROSS_CONTAINER_OPTS="--env RUSTUP_TOOLCHAIN=nightly" \
-          "CARGO_TARGET_${{ matrix.rflags }}_RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no" \
+          export CROSS_CONTAINER_OPTS="--env RUSTUP_TOOLCHAIN=nightly"
+          export "CARGO_TARGET_${{ matrix.rflags }}_RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no"
           "$RUNNER_TEMP/cross" build --release \
             --target ${{ matrix.triple }} -p ${{ matrix.pkg }} \
             $ZFLAGS 2>&1 | tee static.log
