@@ -1,7 +1,9 @@
 name: CI
 
 # 门禁内容对应 docs/plan.md §8.6 DoD 与 §10 G10。
-# 注意：本仓库当前无远端；该文件是 P0 交付物的一部分，供接入 GitHub 后直接生效。
+# 本地与 CI 的分工见 docs/plan.md §4.13：本机 `/` 只读、装不了交叉 target，所以
+# `build-matrix --local` 只跑宿主 musl 档，11 个 blocking 组合由这里的四个 build job 证明。
+# 仓库公开运行（公开仓库的 Actions 不消耗私有仓库额度），因此 build matrix 全量跑。
 on:
   push:
     branches: [master]
@@ -19,7 +21,7 @@ jobs:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # 主门禁跑 stable：这是已被证明能过的形态。MSRV 单独一个 job 验证，
       # 免得「1.89 编不过」把 fmt/clippy/test 一起拖红，看不出失败原因。
@@ -51,7 +53,7 @@ jobs:
     name: rust 1.89 (MSRV)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install MSRV toolchain
         run: |
           rustup toolchain install "$MSRV" --profile minimal
@@ -66,9 +68,9 @@ jobs:
     name: docs 源码引用校验
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Checkout Go baseline
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ph4ntonn/Stowaway
           path: baseline/stowaway
@@ -141,7 +143,7 @@ jobs:
             tier3: true
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # `rust-toolchain.toml` 把 channel 钉在 stable，`rustup default nightly` 在
       # 仓库目录里对它无效；tier-3 需要 nightly 的 `-Z build-std`，只能用
       # RUSTUP_TOOLCHAIN 环境变量压过工具链文件（rustup 的优先级：env > file）。
@@ -232,7 +234,7 @@ jobs:
             triple: aarch64-apple-darwin
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
@@ -257,7 +259,7 @@ jobs:
             bindir: C:/msys64/mingw32/bin
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # bin 目录必须按目标架构选：x86_64 用 mingw64，i686 用 mingw32。都写死
       # mingw64 会让 i686 找到 64 位 dlltool，报
       # "dlltool could not create import library ... CreateProcess"（首次 CI 现象）。
@@ -292,7 +294,7 @@ jobs:
           # 记录的已知限制；冒称"通过"比不跑更糟（E30 的教训）。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: vmactions/freebsd-vm@v1
         with:
           usesh: true
@@ -329,7 +331,7 @@ jobs:
     name: no-panic / no-unsafe / smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
@@ -347,6 +349,6 @@ jobs:
     name: cargo deny (license + advisory)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         continue-on-error: true # P0 阶段仅告警；P7 转为硬门禁（plan.md §10 G10）
