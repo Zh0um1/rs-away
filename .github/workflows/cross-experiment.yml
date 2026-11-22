@@ -164,3 +164,72 @@ jobs:
             grep -m 6 -E "^error|cannot find|undefined reference|collect2" "$f" || echo "  (无匹配)"
             echo
           done
+
+  # 第二个实验：cargo-zigbuild。zig 自带 libc（含 musl 的 crt 与 unwind），
+  # 理论上能一次性绕开「crt 文件不在 ld 搜索路径」「镜像缺 libunwind.a」这两个坑。
+  # README 明确写「只正式支持 Linux 与 macOS 目标」，而我们的 tier-3 正是 Linux。
+  zig:
+    name: zigbuild ${{ matrix.triple }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: armv5te-unknown-linux-musleabi
+            rflags: ARMV5TE_UNKNOWN_LINUX_MUSLEABI
+          - triple: mipsel-unknown-linux-musl
+            rflags: MIPSEL_UNKNOWN_LINUX_MUSL
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup default nightly
+          echo "RUSTUP_TOOLCHAIN=nightly" >> "$GITHUB_ENV"
+
+      # zigbuild 的 zig 由 pip 包 `ziglang` 提供，不依赖系统 apt。
+      - name: Install zig + cargo-zigbuild
+        run: |
+          pip install --quiet ziglang cargo-zigbuild
+          python3 -m ziglang version || zig version
+          cargo zigbuild --version || true
+
+      # zig 的链接目标语法是 `<triple>.<glibc 版本>`，musl 目标写
+      # `<triple>` 即可（musl 不需要 glibc 版本），这里两种都试。
+      - name: ① zigbuild 裸跑
+        continue-on-error: true
+        run: |
+          set +e
+          cargo zigbuild --release --target ${{ matrix.triple }} \
+            -p stowaway-agent -Z build-std=std,panic_abort 2>&1 | tee zig-bare.log
+          echo "ZIG_BARE_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+
+      - name: ② zigbuild + crt-static
+        continue-on-error: true
+        run: |
+          set +e
+          export "CARGO_TARGET_${{ matrix.rflags }}_RUSTFLAGS=-C target-feature=+crt-static"
+          cargo zigbuild --release --target ${{ matrix.triple }} \
+            -p stowaway-agent -Z build-std=std,panic_abort 2>&1 | tee zig-static.log
+          echo "ZIG_STATIC_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+
+      - name: 检查产物
+        if: always()
+        run: |
+          OUT="target/${{ matrix.triple }}/release/stowaway-agent"
+          echo "裸跑        : ${ZIG_BARE_EXIT:-未跑}"
+          echo "+crt-static : ${ZIG_STATIC_EXIT:-未跑}"
+          if [ -f "$OUT" ]; then
+            file "$OUT"
+            readelf -d "$OUT" 2>/dev/null | grep -E "NEEDED" || echo "  (无 NEEDED)"
+            readelf -l "$OUT" 2>/dev/null | grep -i interp || echo "  (无 INTERP)"
+            du -h "$OUT"
+          else
+            echo "没有产物"
+          fi
+          for f in zig-bare.log zig-static.log; do
+            [ -f "$f" ] || continue
+            echo "=== $f 错误 ==="
+            grep -m 5 -E "^error|cannot find|undefined reference" "$f" || echo "  (无)"
+          done
