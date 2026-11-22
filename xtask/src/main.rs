@@ -1290,12 +1290,11 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
         // 回落宿主 cargo，zigbuild 也可能退化成动态链接。tier-3 的交付形态是
         // 「无 PT_INTERP」，直接从产物里读，而不是相信调用链（plan §4.14 E34）。
         if row.tier3
-            && let Some(dynamic) = interp_kind(&artifact_path)
+            && let Err(why) = verify_static(&artifact_path)
         {
             let msg = format!(
-                "tier-3 产物 {} 不是静态链接（{}），交付形态应为无 PT_INTERP",
-                display_rel(root, &artifact_path),
-                dynamic
+                "tier-3 产物 {} 不是静态链接（{why}），交付形态应为无 PT_INTERP",
+                display_rel(root, &artifact_path)
             );
             println!("    failed：{msg}");
             return Status::Failed(msg);
@@ -1309,26 +1308,34 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
         Status::Ok { bytes, alias }
     }
 
-    /// 读 ELF 程序头，判断产物有没有解释器段。
+    /// 确认 tier-3 产物是静态的（无 `PT_INTERP`）。
     ///
-    /// 返回 `Some(说明)` 表示「动态链接」（存在 `PT_INTERP`），`None` 表示
-    /// 「静态或无解释器」（含非 ELF：PE/Mach-O 不在 tier-3 的判据范围里）。
+    /// 这里刻意把「读不出文件」「不是 ELF」都当成失败，而不是「跳过检查」：
+    /// 对 tier-3 的 Linux 目标来说，产物本来就是 ELF，读不出来或不是 ELF 是
+    /// 判据没跑成，不能当成「验过了」。这与 plan §4.14 E30（前置步骤静默没
+    /// 做事、错误延后到链接期）是同一类问题——**做不到要说出来**。
     ///
-    /// 只看 `PT_INTERP` 而不看 `DT_NEEDED`：`static-pie`（zigbuild 的 mipsel
+    /// 只查 `PT_INTERP` 而不查 `DT_NEEDED`：`static-pie`（zigbuild 的 mipsel
     /// 产物）没有解释器但保留动态段，那是合法的静态形态；有解释器就一定不是。
-    fn interp_kind(path: &Path) -> Option<String> {
-        let bytes = std::fs::read(path).ok()?;
-        if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" {
-            return None;
+    fn verify_static(path: &Path) -> std::result::Result<(), String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("怀疑没验成——读取产物失败：{e}"))?;
+        if bytes.len() < 64 {
+            return Err(format!(
+                "怀疑没验成——产物只有 {} 字节，不是 ELF",
+                bytes.len()
+            ));
+        }
+        if &bytes[..4] != b"\x7fELF" {
+            return Err("怀疑没验成——产物不是 ELF".to_string());
         }
         let is_64 = match bytes[4] {
             2 => true,
             1 => false,
-            _ => return None,
+            other => return Err(format!("怀疑没验成——未知的 ELF 类别 {other}")),
         };
         // 本机与 CI 的 tier-3 runner 都是小端；大端 ELF 不在支持范围内。
         if bytes[5] != 1 {
-            return None;
+            return Err(format!("怀疑没验成——未知的 ELF 字节序 {}", bytes[5]));
         }
         let u16_at = |off: usize| -> Option<u16> {
             let b = bytes.get(off..off + 2)?;
@@ -1344,29 +1351,31 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
             ]))
         };
-        let phoff = if is_64 {
-            u64_at(32)? as usize
+        let (phoff, phentsize, phnum) = if is_64 {
+            (u64_at(32), u16_at(54), u16_at(56))
         } else {
-            u32_at(28)? as usize
+            (u32_at(28).map(u64::from), u16_at(42), u16_at(44))
         };
-        let phentsize = if is_64 {
-            u16_at(54)? as usize
-        } else {
-            u16_at(42)? as usize
+        let (Some(phoff), Some(phentsize), Some(phnum)) = (phoff, phentsize, phnum) else {
+            return Err("怀疑没验成——ELF 头被截断，读不到程序头表".to_string());
         };
-        let phnum = if is_64 {
-            u16_at(56)? as usize
-        } else {
-            u16_at(44)? as usize
-        };
+        if phentsize < 32 || phnum == 0 {
+            return Err(format!(
+                "怀疑没验成——程序头表异常（{} 条，每条 {} 字节）",
+                phnum, phentsize
+            ));
+        }
         const PT_INTERP: u32 = 3;
-        for i in 0..phnum {
-            let base = phoff + i * phentsize;
-            if u32_at(base)? == PT_INTERP {
-                return Some("存在 PT_INTERP".to_string());
+        for i in 0..usize::from(phnum) {
+            let base = phoff as usize + i * usize::from(phentsize);
+            let Some(ptype) = u32_at(base) else {
+                return Err(format!("怀疑没验成——第 {i} 条程序头越界"));
+            };
+            if ptype == PT_INTERP {
+                return Err("存在 PT_INTERP".to_string());
             }
         }
-        None
+        Ok(())
     }
 
     /// 内部 `cargo` 调用要不要加 `--offline`。
@@ -1765,22 +1774,41 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
 
             let dynamic = dir.join("dynamic");
             std::fs::write(&dynamic, synth_elf(3, 1)).expect("write");
-            assert!(
-                interp_kind(&dynamic).is_some(),
-                "PT_INTERP 必须被认出来，否则 tier-3 的动态产物会被当成合规"
-            );
+            let err = verify_static(&dynamic).expect_err("PT_INTERP 必须被判成动态");
+            assert!(err.contains("PT_INTERP"), "错误要指出根因，实际是：{err}");
 
             let statik = dir.join("static");
             std::fs::write(&statik, synth_elf(1, 2)).expect("write");
             assert_eq!(
-                interp_kind(&statik),
-                None,
-                "static-pie 没有解释器，不能被判成动态（zigbuild 的 mipsel 就是这种形态）"
+                verify_static(&statik),
+                Ok(()),
+                "static-pie 没有解释器，必须放过（zigbuild 的 mipsel 就是这种形态）"
             );
 
-            let not_elf = dir.join("pe");
-            std::fs::write(&not_elf, b"MZ\x90\x00").expect("write");
-            assert_eq!(interp_kind(&not_elf), None, "非 ELF 直接放过");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_failed_check_is_a_failure_not_a_pass() {
+            let dir = std::env::temp_dir().join(format!("stw-xtask-bad-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+
+            let missing = dir.join("nope");
+            assert!(
+                verify_static(&missing).is_err(),
+                "读不到文件不能被当成验过了"
+            );
+
+            let pe = dir.join("pe");
+            std::fs::write(&pe, b"MZ\x90\x00").expect("write");
+            assert!(verify_static(&pe).is_err(), "非 ELF 不能被当成验过了");
+
+            let truncated = dir.join("trunc");
+            std::fs::write(&truncated, b"\x7fELF\x02\x01").expect("write");
+            assert!(
+                verify_static(&truncated).is_err(),
+                "截断的 ELF 不能被当成验过了"
+            );
 
             let _ = std::fs::remove_dir_all(&dir);
         }
