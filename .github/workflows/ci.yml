@@ -179,9 +179,20 @@ jobs:
           # 两者提供同一套 `_Unwind_*`，`libgcc_eh.a` 就是 GCC 自带的 unwind 实现。
           # 实测：`gcc -lunwind -static` 在有该符号链接时能出正确 ELF，缺了则
           # `ld: cannot find -lunwind`（本轮 CI 的 arm 失败点）。
-          glib=$(find "$RUNNER_TEMP/${{ matrix.xcc_dir }}/lib/gcc" -maxdepth 2 -name libgcc_eh.a | head -1)
-          if [ -n "$glib" ] && [ ! -e "$(dirname "$glib")/libunwind.a" ]; then
+          # `-maxdepth` 必须够深：真实路径是 `lib/gcc/<triple>/<version>/libgcc_eh.a`，
+          # 相对 `lib/gcc` 是第 3 层。写 `-maxdepth 2` 会 find 不到、`if` 恒假、
+          # 符号链接从未建出来（本机曾因手工建过一次而误判为已生效）。
+          glib=$(find "$RUNNER_TEMP/${{ matrix.xcc_dir }}/lib/gcc" -name libgcc_eh.a | head -1)
+          if [ -z "$glib" ]; then
+            echo "::error::在 ${{ matrix.xcc_dir }} 里找不到 libgcc_eh.a，无法补 libunwind.a（布局变了？）"
+            exit 1
+          fi
+          if [ ! -e "$(dirname "$glib")/libunwind.a" ]; then
             ln -s libgcc_eh.a "$(dirname "$glib")/libunwind.a"
+          fi
+          if [ ! -e "$(dirname "$glib")/libunwind.a" ]; then
+            echo "::error::libunwind.a 符号链接没建出来：$(dirname "$glib")"
+            exit 1
           fi
           # 静态链接（下面 Configure cross compiler 里的 `+crt-static`）会让 mips 的
           # 链接行也带上 `-lunwind`，所以这条符号链接两档都需要，不只是 arm。
