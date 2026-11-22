@@ -1,0 +1,148 @@
+name: cross 实验
+
+# 回答一个问题：tier-3 两档（armv5te / mipsel）该不该改用 cross-rs 而不是
+# `docs/plan.md` §4.13 现在用的「Bootlin 工具链 + RUSTFLAGS」那套手工配方。
+#
+# 独立工作流、只手动触发：这是选型实验，不是发布判据。
+# 正式判据仍在 ci.yml 的 `build linux/arm (tier-3)` 与 `build linux/mipsel (tier-3)`。
+#
+# 背景（为什么值得测）：现在的手工配方要自己解决三件事——
+#   ① `crt-static-default=true` 让 rustc 传 `-nostartfiles` 并点名裸文件名 `crt*.o`，
+#      而 GNU ld 的 `-L` 只查库不查目标文件 → 要 `-C link-self-contained=no`；
+#   ② arm 的链接行多传 `-lunwind`，Bootlin sysroot 只有 `libgcc_eh.a` → 要建符号链接；
+#   ③ 静态产物要 `+crt-static`。
+# cross 若把 ①② 都替我们做掉，配方就能从 4 个 matrix 字段缩成 1 条命令。
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # cross 的预编译包版本；与 §4.13 无耦合，只影响实验本身。
+  CROSS_VERSION: "0.2.5"
+
+jobs:
+  probe:
+    name: probe ${{ matrix.triple }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: armv5te-unknown-linux-musleabi
+            rflags: ARMV5TE_UNKNOWN_LINUX_MUSLEABI
+            pkg: stowaway-agent
+            tier3: true
+          - triple: mipsel-unknown-linux-musl
+            rflags: MIPSEL_UNKNOWN_LINUX_MUSL
+            pkg: stowaway-agent
+            tier3: true
+          # 对照组：非 tier-3，cross 只需镜像里的预编译 std。
+          - triple: aarch64-unknown-linux-gnu
+            rflags: AARCH64_UNKNOWN_LINUX_GNU
+            pkg: stowaway-agent
+            tier3: false
+    steps:
+      - uses: actions/checkout@v7
+
+      # tier-3 没有预编译 std，必须 `-Z build-std`；这要 nightly + rust-src。
+      # `rust-toolchain.toml` 把 channel 钉在 stable，所以两个工具链都装、
+      # 再用 RUSTUP_TOOLCHAIN 压过工具链文件（rustup 优先级：env > file）。
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup default stable
+          echo "RUSTUP_TOOLCHAIN=nightly" >> "$GITHUB_ENV"
+
+      - name: Install cross
+        run: |
+          curl -sSL -o "$RUNNER_TEMP/cross.tgz" \
+            "https://github.com/cross-rs/cross/releases/download/v${CROSS_VERSION}/cross-x86_64-unknown-linux-gnu.tar.gz"
+          tar -xzf "$RUNNER_TEMP/cross.tgz" -C "$RUNNER_TEMP"
+          chmod +x "$RUNNER_TEMP/cross"
+          "$RUNNER_TEMP/cross" --version
+
+      - name: Docker info
+        run: docker version --format '{{.Server.Version}}'
+
+      # `-Z build-std` 是 nightly-only，所以 tier-3 才拼这一段；非 tier-3 走预编译 std。
+      - name: 拼 build-std 参数
+        run: |
+          if [ "${{ matrix.tier3 }}" = "true" ]; then
+            echo "ZFLAGS=-Z build-std=std,panic_abort" >> "$GITHUB_ENV"
+          else
+            echo "ZFLAGS=" >> "$GITHUB_ENV"
+          fi
+
+      # 第一问：cross 裸跑能不能过？
+      # 若这里就绿了，说明 cross 的镜像替我们解决了起始文件与 libunwind 两件事。
+      # 预期为红：cross 的 Dockerfile 只设 `CARGO_TARGET_*_LINKER` 与 `CC_*`，
+      # 不设 RUSTFLAGS，所以 `crt-static` 的 `-nostartfiles` 仍在。
+      - name: ① 裸跑（不加 RUSTFLAGS）
+        continue-on-error: true
+        run: |
+          set +e
+          "$RUNNER_TEMP/cross" build --release \
+            --target ${{ matrix.triple }} -p ${{ matrix.pkg }} \
+            $ZFLAGS 2>&1 | tee bare.log
+          echo "BARE_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+
+      # 第二问：只补 `link-self-contained=no` 够不够？
+      # tier-3 用 `-Z build-std` 时，容器内的 rustc 还要能读到 rust-src；
+      # cross 会把宿主的 rustup 目录挂进容器，但 `RUSTUP_TOOLCHAIN` 不以
+      # CARGO_/CROSS_ 开头、默认不传，所以显式用 CROSS_CONTAINER_OPTS 传进去
+      # （cross 文档给的就是这种 `--env` 用法）。
+      - name: ② 补 link-self-contained=no
+        continue-on-error: true
+        run: |
+          set +e
+          CROSS_CONTAINER_OPTS="--env RUSTUP_TOOLCHAIN=nightly" \
+          "CARGO_TARGET_${{ matrix.rflags }}_RUSTFLAGS=-C link-self-contained=no" \
+          "$RUNNER_TEMP/cross" build --release \
+            --target ${{ matrix.triple }} -p ${{ matrix.pkg }} \
+            $ZFLAGS 2>&1 | tee selfless.log
+          echo "SELFLESS_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+
+      # 第三问：再加 `+crt-static` 能否得到静态产物（发布形态）。
+      - name: ③ 补 link-self-contained=no + crt-static
+        continue-on-error: true
+        run: |
+          set +e
+          CROSS_CONTAINER_OPTS="--env RUSTUP_TOOLCHAIN=nightly" \
+          "CARGO_TARGET_${{ matrix.rflags }}_RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no" \
+          "$RUNNER_TEMP/cross" build --release \
+            --target ${{ matrix.triple }} -p ${{ matrix.pkg }} \
+            $ZFLAGS 2>&1 | tee static.log
+          echo "STATIC_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+
+      # 产物属性：INTERP/NEEDED 都为空才是真正的静态 musl。
+      - name: 检查产物
+        if: always()
+        run: |
+          OUT="target/${{ matrix.triple }}/release/${{ matrix.pkg }}"
+          echo "=== 三次尝试的退出码 ==="
+          echo "裸跑             : ${BARE_EXIT:-未跑}"
+          echo "self-contained=no: ${SELFLESS_EXIT:-未跑}"
+          echo "+crt-static      : ${STATIC_EXIT:-未跑}"
+          echo
+          if [ -f "$OUT" ]; then
+            echo "=== file ==="; file "$OUT"
+            echo "=== 动态段（为空 = 静态）==="
+            readelf -d "$OUT" 2>/dev/null | grep -E "NEEDED" || echo "  (无 NEEDED)"
+            readelf -l "$OUT" 2>/dev/null | grep -i interp || echo "  (无 INTERP)"
+            echo "=== 大小 ==="; du -h "$OUT"
+          else
+            echo "没有产物：$OUT 不存在"
+          fi
+
+      # 失败证据集中成一段，省得逐个翻日志。
+      - name: 失败摘要
+        if: always()
+        run: |
+          for f in bare.log selfless.log static.log; do
+            [ -f "$f" ] || continue
+            echo "=== $f 的关键错误行 ==="
+            grep -m 6 -E "^error|cannot find|undefined reference|collect2" "$f" || echo "  (无匹配)"
+            echo
+          done
