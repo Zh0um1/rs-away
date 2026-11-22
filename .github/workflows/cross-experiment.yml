@@ -6,6 +6,10 @@ name: cross 实验
 # 独立工作流、只手动触发：这是选型实验，不是发布判据。
 # 正式判据仍在 ci.yml 的 `build linux/arm (tier-3)` 与 `build linux/mipsel (tier-3)`。
 #
+# 结论已被采纳（plan §4.14 E34）：armv5te 用 cross 裸跑、mipsel 用 zigbuild 裸跑。
+# 本工作流保留为选型证据——若将来换工具链版本或目标，先在这里重跑四问，
+# 再改 ci.yml 与 xtask 的 Combo.builder。
+#
 # 背景（为什么值得测）：现在的手工配方要自己解决三件事——
 #   ① `crt-static-default=true` 让 rustc 传 `-nostartfiles` 并点名裸文件名 `crt*.o`，
 #      而 GNU ld 的 `-L` 只查库不查目标文件 → 要 `-C link-self-contained=no`；
