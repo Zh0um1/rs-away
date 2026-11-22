@@ -587,6 +587,7 @@ mod build_matrix {
             agent: true,
             admin: true,
             tier3: false,
+            builder: Builder::Cargo,
         },
         Combo {
             os: "linux",
@@ -596,6 +597,7 @@ mod build_matrix {
             agent: true,
             admin: true,
             tier3: false,
+            builder: Builder::Cargo,
         },
         Combo {
             os: "linux",
@@ -605,6 +607,7 @@ mod build_matrix {
             agent: true,
             admin: true,
             tier3: false,
+            builder: Builder::Cargo,
         },
         Combo {
             os: "linux",
@@ -614,6 +617,7 @@ mod build_matrix {
             agent: true,
             admin: false,
             tier3: true,
+            builder: Builder::Cross,
         },
         Combo {
             os: "linux",
@@ -623,6 +627,7 @@ mod build_matrix {
             agent: true,
             admin: false,
             tier3: true,
+            builder: Builder::Zigbuild,
         },
         Combo {
             os: "darwin",
@@ -632,6 +637,7 @@ mod build_matrix {
             agent: true,
             admin: true,
             tier3: false,
+            builder: Builder::Cargo,
         },
         Combo {
             os: "darwin",
@@ -641,6 +647,7 @@ mod build_matrix {
             agent: true,
             admin: true,
             tier3: false,
+            builder: Builder::Cargo,
         },
         Combo {
             os: "windows",
@@ -650,6 +657,7 @@ mod build_matrix {
             agent: true,
             admin: true,
             tier3: false,
+            builder: Builder::Cargo,
         },
         Combo {
             os: "windows",
@@ -659,6 +667,7 @@ mod build_matrix {
             agent: true,
             admin: true,
             tier3: false,
+            builder: Builder::Cargo,
         },
         Combo {
             os: "freebsd",
@@ -668,6 +677,7 @@ mod build_matrix {
             agent: true,
             admin: true,
             tier3: false,
+            builder: Builder::Cargo,
         },
         Combo {
             // Go 版是 `GOOS=freebsd GOARCH=arm GOARM=5`；Rust 侧最低可选目标是 armv6。
@@ -678,6 +688,7 @@ mod build_matrix {
             agent: true,
             admin: true,
             tier3: false,
+            builder: Builder::Cargo,
         },
     ];
 
@@ -695,6 +706,7 @@ mod build_matrix {
             agent: true,
             admin: true,
             tier3: false,
+            builder: Builder::Cargo,
         },
         Combo {
             os: "linux",
@@ -704,6 +716,7 @@ mod build_matrix {
             agent: true,
             admin: true,
             tier3: false,
+            builder: Builder::Cargo,
         },
         Combo {
             os: "linux",
@@ -713,6 +726,7 @@ mod build_matrix {
             agent: true,
             admin: true,
             tier3: false,
+            builder: Builder::Cargo,
         },
         Combo {
             os: "linux",
@@ -722,8 +736,42 @@ mod build_matrix {
             agent: true,
             admin: true,
             tier3: false,
+            builder: Builder::Cargo,
         },
     ];
+
+    /// 谁来执行交叉编译。这三者不是「哪个更好」，而是实测出来的分工
+    /// （plan §4.14 E34）：同一套 `RUSTFLAGS` 在不同 sysroot 上方向相反，
+    /// 所以按目标各自选一个能出静态发布形态的驱动器，比统一硬凑一套配方可靠。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Builder {
+        /// 宿主/官方 target 直接 `cargo build`（CI 里由 job 预先 `rustup target add`）。
+        Cargo,
+        /// `cross`（容器内 crosstool-ng sysroot）。armv5te 裸跑即静态 EXEC。
+        Cross,
+        /// `cargo-zigbuild`（zig 自带 libc）。mipsel 裸跑即 static-pie、无 INTERP。
+        Zigbuild,
+    }
+
+    impl Builder {
+        /// 产物目录里用的名字（也是 `--dry-run` 打印的命令名）。
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Cargo => "cargo",
+                Self::Cross => "cross",
+                Self::Zigbuild => "zigbuild",
+            }
+        }
+
+        /// 需要通过 `PATH` 找的可执行文件；`Cargo` 用 rustup 装的 `cargo`，不查。
+        const fn command(self) -> Option<&'static str> {
+            match self {
+                Self::Cargo => None,
+                Self::Cross => Some("cross"),
+                Self::Zigbuild => Some("cargo-zigbuild"),
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct Combo {
@@ -734,8 +782,10 @@ mod build_matrix {
         plat: &'static str,
         agent: bool,
         admin: bool,
-        /// tier-3：std 无预编译产物，需 nightly + `-Z build-std`，且要关 TLS/ws/kcp。
+        /// tier-3：std 无预编译产物，需 nightly + `-Z build-std`。
         tier3: bool,
+        /// 这个组合由哪个驱动器编译（见 [`Builder`]）。
+        builder: Builder,
     }
 
     impl Combo {
@@ -974,11 +1024,35 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
                 tc.release
             ));
         }
+        // 非 `Cargo` 驱动器要独立安装的可执行文件（cross / cargo-zigbuild）。
+        // 缺了就跳过并说清缺失的是哪个命令，而不是让它走到 build_one 里报
+        // `无法执行 \`cross\`` 那种「看起来像构建失败」的形态。
+        if let Some(cmd) = row.builder.command().filter(|c| !have_command(c)) {
+            reasons.push(format!(
+                "缺少 `{cmd}` 命令（{}）",
+                match row.builder {
+                    Builder::Cross => "装 cross-rs 后才有，见 plan §4.13",
+                    Builder::Zigbuild => "`pip install cargo-zigbuild` 后才有，见 plan §4.13",
+                    Builder::Cargo => unreachable!(),
+                }
+            ));
+        }
         if reasons.is_empty() {
             None
         } else {
             Some(reasons.join("；"))
         }
+    }
+
+    /// `PATH` 里有没有这个可执行文件（不真的运行它——`cross --version` 要 1 秒起步）。
+    fn have_command(name: &str) -> bool {
+        let Some(paths) = std::env::var_os("PATH") else {
+            return false;
+        };
+        std::env::split_paths(&paths).any(|dir| {
+            let p = dir.join(name);
+            p.is_file()
+        })
     }
 
     pub fn run(root: &Path, cfg: &Config) -> ExitCode {
@@ -1241,15 +1315,22 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
     fn build_argv(root: &Path, row: &Combo, side: Side) -> Vec<String> {
         // 链接 **release** 时两个 ~90MB 二进制并行会让 LLVM 自己崩（plan §4.14 E27），
         // 因此这里固定 `-j 1` —— 每次调用只产出一个二进制，串行链接是唯一稳的形态。
-        let mut v: Vec<String> = ["cargo", "build", "--release", "-j", "1"]
-            .map(String::from)
-            .to_vec();
-        if use_offline(root) {
+        let mut v: Vec<String> = match row.builder {
+            // `cross` 与 `cargo-zigbuild` 都是 cargo 的子命令（独立安装的可执行文件），
+            // 参数形态与 `cargo build` 同形，只是多了容器/zig 包装。
+            Builder::Cargo => ["cargo", "build", "--release", "-j", "1"],
+            Builder::Cross => ["cross", "build", "--release", "-j", "1"],
+            Builder::Zigbuild => ["cargo", "zigbuild", "--release", "-j", "1"],
+        }
+        .map(String::from)
+        .to_vec();
+        if use_offline(root) && allows_offline(row) {
             v.push("--offline".to_string());
         }
         if row.tier3 {
-            // tier-3 无预编译 std；feature 门控（关 tls/ws/kcp）需 crate 侧配合，
-            // 见 plan §4.13 / §9.1。本机非 nightly 时早已在 unavailable() 里跳过。
+            // tier-3 无预编译 std，只能现场编：`-Z build-std` 需要 nightly。
+            // `unavailable()` 已经把「非 nightly」判成 skipped，所以走到这里必然有
+            // nightly（CI 用 RUSTUP_TOOLCHAIN=nightly 压过 rust-toolchain.toml）。
             v.push("-Z".to_string());
             v.push("build-std=std,panic_abort".to_string());
         }
@@ -1260,6 +1341,15 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
             side.pkg().to_string(),
         ]);
         v
+    }
+
+    /// tier-3 的 `-Z build-std` 必须能联网拉 std 的依赖（`wasip1` 等）。
+    ///
+    /// 本机没有 nightly 的 registry 缓存，`--offline` 会直接报
+    /// `no matching package named \`wasip1\` found`；CI 则本来就要现拉依赖。
+    /// 所以只在「非 tier-3」时允许 `use_offline()` 生效。
+    fn allows_offline(row: &Combo) -> bool {
+        !row.tier3
     }
 
     fn host_bin(target_dir: &Path, row: &Combo, side: Side) -> PathBuf {
@@ -1349,8 +1439,8 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
             );
         }
         println!(
-            "{:<10} {:<9} {:<22} {:<24} {:<34} AVAIL",
-            "OS", "ARCH", "AGENT", "ADMIN", "TRIPLE"
+            "{:<10} {:<9} {:<22} {:<24} {:<34} {:<9} AVAIL",
+            "OS", "ARCH", "AGENT", "ADMIN", "TRIPLE", "BUILDER"
         );
         let mut usable = 0usize;
         for row in combos {
@@ -1365,17 +1455,19 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
                 agent.push_str(" (t3)");
             }
             println!(
-                "{:<10} {:<9} {:<22} {:<24} {:<34} {}",
+                "{:<10} {:<9} {:<22} {:<24} {:<34} {:<9} {}",
                 row.os,
                 row.arch,
                 agent,
                 admin.unwrap_or_else(|| "-".to_string()),
                 row.triple,
+                row.builder.label(),
                 if avail { "yes" } else { "no" }
             );
         }
+        println!("\n(t3) = tier-3 目标：std 无预编译件，需 nightly + `-Z build-std`（plan §4.13）");
         println!(
-            "\n(t3) = tier-3 目标：需 nightly + `-Z build-std`，并关 TLS/ws/kcp（plan §4.13）"
+            "BUILDER = 谁来编译：cargo（宿主/预装 target）· cross（crosstool-ng 容器）\n          · zigbuild（zig 自带 libc）。选择依据见 plan §4.14 E34。"
         );
         println!(
             "可用 {usable}/{}（toolchain {}，已装 target {} 个）",
@@ -1514,6 +1606,7 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
                 agent: true,
                 admin: true,
                 tier3,
+                builder: Builder::Cargo,
             }
         }
 
@@ -1563,6 +1656,76 @@ tier-3（armv5te / mipsel）需 nightly + `-Z build-std`，并关掉 tls / ws / 
         fn available_targets_are_available() {
             let t = tc(&["x86_64-unknown-linux-gnu"], false);
             assert!(unavailable(&row("x86_64-unknown-linux-gnu", false), &t).is_none());
+        }
+
+        fn row_with(triple: &'static str, tier3: bool, builder: Builder) -> Combo {
+            let mut c = row(triple, tier3);
+            c.builder = builder;
+            c
+        }
+
+        #[test]
+        fn tier3_rows_are_built_by_their_own_driver() {
+            // 分工是实测结论（plan §4.14 E34），不是偏好：两个驱动器各自只在一个
+            // 目标上能出静态发布形态。这条锁住「别在重构时把两档都改回 cargo」。
+            let arm = MATRIX
+                .iter()
+                .find(|c| c.triple == "armv5te-unknown-linux-musleabi")
+                .expect("armv5te 必须在 blocking 矩阵里");
+            let mips = MATRIX
+                .iter()
+                .find(|c| c.triple == "mipsel-unknown-linux-musl")
+                .expect("mipsel 必须在 blocking 矩阵里");
+            assert_eq!(arm.builder, Builder::Cross);
+            assert_eq!(mips.builder, Builder::Zigbuild);
+            // 其余组合一律走 cargo：多引入一个驱动器就多一份失败面。
+            for c in MATRIX.iter().filter(|c| !c.tier3) {
+                assert_eq!(c.builder, Builder::Cargo, "{} 应该走 cargo", c.triple);
+            }
+        }
+
+        #[test]
+        fn build_argv_dispatches_on_the_driver() {
+            let root = Path::new(".");
+            let arm = row_with("armv5te-unknown-linux-musleabi", true, Builder::Cross);
+            let argv = build_argv(root, &arm, Side::Agent);
+            assert_eq!(argv[0], "cross", "cross 自己的命令名：{argv:?}");
+            assert!(argv.iter().any(|a| a == "build-std=std,panic_abort"));
+
+            let mips = row_with("mipsel-unknown-linux-musl", true, Builder::Zigbuild);
+            let argv = build_argv(root, &mips, Side::Agent);
+            assert_eq!(
+                &argv[..2],
+                ["cargo", "zigbuild"],
+                "zigbuild 是 cargo 子命令：{argv:?}"
+            );
+
+            let plain = row("x86_64-unknown-linux-gnu", false);
+            let argv = build_argv(root, &plain, Side::Agent);
+            assert_eq!(&argv[..2], ["cargo", "build"]);
+            assert!(
+                !argv.iter().any(|a| a.starts_with("build-std")),
+                "非 tier-3 不带 build-std：{argv:?}"
+            );
+        }
+
+        #[test]
+        fn missing_driver_is_skipped_with_a_specific_reason() {
+            // 驱动器没装时要说清缺哪条命令，而不是走到 build_one 里报
+            // 「无法执行 `cross`」——那看起来像构建失败，实际是环境没准备好。
+            // 结论取决于本机装没装 cross，所以两条分支都要写死断言，
+            // 免得这条测试在开发机与 CI 上给出相反的「通过」。
+            let t = tc(&[], true);
+            let r = unavailable(
+                &row_with("armv5te-unknown-linux-musleabi", true, Builder::Cross),
+                &t,
+            );
+            if have_command("cross") {
+                assert!(r.is_none(), "装了 cross 就不该因驱动器被判跳过：{r:?}");
+            } else {
+                let reason = r.expect("缺 cross 时必须给出原因");
+                assert!(reason.contains("cross"), "原因要点名缺失的命令：{reason}");
+            }
         }
     }
 }
