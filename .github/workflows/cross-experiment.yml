@@ -116,6 +116,23 @@ jobs:
             $ZFLAGS 2>&1 | tee static.log
           echo "STATIC_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
 
+      # 第四问（关键补测）：`+crt-static` **单独**加、不碰 self-contained。
+      # 前三问证明：cross 的 crosstool-ng 镜像里 rustc 默认的 self-contained 模式
+      # 已经能找到全部 crt 与 unwind 件（裸跑即静态），一旦改成
+      # `link-self-contained=no` 就把起始文件交回 gcc 驱动，而镜像缺 `libunwind.a`
+      # → `ld: cannot find -lunwind`（②③ 两问红在这一点）。
+      # 所以正确的组合应只是 `+crt-static`，让 mips 也从动态 PIE 变静态 EXEC。
+      - name: ④ 只加 crt-static
+        continue-on-error: true
+        run: |
+          set +e
+          export CROSS_CONTAINER_OPTS="--env RUSTUP_TOOLCHAIN=nightly"
+          export "CARGO_TARGET_${{ matrix.rflags }}_RUSTFLAGS=-C target-feature=+crt-static"
+          "$RUNNER_TEMP/cross" build --release \
+            --target ${{ matrix.triple }} -p ${{ matrix.pkg }} \
+            $ZFLAGS 2>&1 | tee staticonly.log
+          echo "STATICONLY_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+
       # 产物属性：INTERP/NEEDED 都为空才是真正的静态 musl。
       - name: 检查产物
         if: always()
@@ -125,6 +142,7 @@ jobs:
           echo "裸跑             : ${BARE_EXIT:-未跑}"
           echo "self-contained=no: ${SELFLESS_EXIT:-未跑}"
           echo "+crt-static      : ${STATIC_EXIT:-未跑}"
+          echo "只加 crt-static   : ${STATICONLY_EXIT:-未跑}"
           echo
           if [ -f "$OUT" ]; then
             echo "=== file ==="; file "$OUT"
@@ -140,7 +158,7 @@ jobs:
       - name: 失败摘要
         if: always()
         run: |
-          for f in bare.log selfless.log static.log; do
+          for f in bare.log selfless.log static.log staticonly.log; do
             [ -f "$f" ] || continue
             echo "=== $f 的关键错误行 ==="
             grep -m 6 -E "^error|cannot find|undefined reference|collect2" "$f" || echo "  (无匹配)"
